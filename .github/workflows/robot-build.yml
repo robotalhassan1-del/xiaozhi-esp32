@@ -1,0 +1,29 @@
+name: Build My Robot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build robot firmware
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          python scripts/build.py bread-compact-wifi --name bread-compact-wifi-128x64 --language en-US --wake-word wn9_heykira_tts3
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: my-robot-firmware
+          path: build/merged-binary.bin
+          if-no-files-found: error
