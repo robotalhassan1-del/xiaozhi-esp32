@@ -56,4 +56,12 @@
 // A MCP Test: Control a lamp
 #define LAMP_GPIO GPIO_NUM_18
 
+// Fan relay (HIGH = on)
+#define FAN_GPIO GPIO_NUM_8
+
+// Flame sensor DO pin. Most LM393 modules pull DO LOW when flame is detected.
+// If yours does the opposite, change FLAME_ACTIVE_LEVEL to 1.
+#define FLAME_GPIO GPIO_NUM_2
+#define FLAME_ACTIVE_LEVEL 0
+
 #endif // _BOARD_CONFIG_H_

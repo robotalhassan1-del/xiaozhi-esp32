@@ -31,6 +31,7 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+    bool fan_on_ = false;
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -150,6 +151,53 @@ private:
     // 物联网初始化，逐步迁移到 MCP 协议
     void InitializeTools() {
         static LampController lamp(LAMP_GPIO);
+
+        // Fan relay
+        gpio_config_t fan_config = {
+            .pin_bit_mask = (1ULL << FAN_GPIO),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&fan_config));
+        gpio_set_level(FAN_GPIO, 0);
+
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.fan.get_state", "Get the power state of the fan", PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return fan_on_ ? "{\"power\": true}" : "{\"power\": false}";
+            });
+        mcp_server.AddTool("self.fan.turn_on", "Turn on the fan", PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                fan_on_ = true;
+                gpio_set_level(FAN_GPIO, 1);
+                return true;
+            });
+        mcp_server.AddTool("self.fan.turn_off", "Turn off the fan", PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                fan_on_ = false;
+                gpio_set_level(FAN_GPIO, 0);
+                return true;
+            });
+
+        // Flame sensor (digital output, read on demand)
+        gpio_config_t flame_config = {
+            .pin_bit_mask = (1ULL << FLAME_GPIO),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&flame_config));
+
+        mcp_server.AddTool("self.flame.get_state",
+            "Check the flame sensor. Returns whether a flame or fire is currently detected",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool detected = gpio_get_level(FLAME_GPIO) == FLAME_ACTIVE_LEVEL;
+                return detected ? "{\"flame_detected\": true}" : "{\"flame_detected\": false}";
+            });
     }
 
 public:
