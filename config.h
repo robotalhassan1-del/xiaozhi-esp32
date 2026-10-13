@@ -73,10 +73,10 @@
 // While the fire lasts, the alarm sound repeats every FLAME_REPEAT_TICKS (50 = 5 s).
 #define FLAME_REPEAT_TICKS 50
 
-// Best effort: ask the AI to speak a warning out loud. This relies on the server
-// treating the text below as something the user said. If the robot only greets you
+// Best effort: send a SHORT text to the AI (long text is rejected by the server).
+// The Role prompt must say what to do when it hears "Fire alert". If the robot only greets you
 // ("Hi there") instead of warning, set this to 0. The sound and screen alarm still work.
 #define FLAME_ALERT_SPEAK_VIA_AI 1
-#define FLAME_ALERT_AI_TEXT "Emergency! My flame sensor has detected a fire. Warn me loudly right now that there is a fire, tell me to stay safe and call emergency services."
+#define FLAME_ALERT_AI_TEXT "Fire alert"
 
 #endif // _BOARD_CONFIG_H_
