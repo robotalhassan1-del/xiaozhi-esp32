@@ -64,4 +64,19 @@
 #define FLAME_GPIO GPIO_NUM_2
 #define FLAME_ACTIVE_LEVEL 0
 
+// Automatic fire alarm: the robot warns by itself when the flame sensor sees a fire.
+// The sensor is read every 100 ms. A fire is confirmed after FLAME_CONFIRM_TICKS
+// readings in a row (5 = 0.5 s) and cleared after FLAME_CLEAR_TICKS (30 = 3 s).
+#define FLAME_ALERT_ENABLED 1
+#define FLAME_CONFIRM_TICKS 5
+#define FLAME_CLEAR_TICKS 30
+// While the fire lasts, the alarm sound repeats every FLAME_REPEAT_TICKS (50 = 5 s).
+#define FLAME_REPEAT_TICKS 50
+
+// Best effort: ask the AI to speak a warning out loud. This relies on the server
+// treating the text below as something the user said. If the robot only greets you
+// ("Hi there") instead of warning, set this to 0. The sound and screen alarm still work.
+#define FLAME_ALERT_SPEAK_VIA_AI 1
+#define FLAME_ALERT_AI_TEXT "Emergency! My flame sensor has detected a fire. Warn me loudly right now that there is a fire, tell me to stay safe and call emergency services."
+
 #endif // _BOARD_CONFIG_H_

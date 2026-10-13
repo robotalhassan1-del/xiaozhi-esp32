@@ -11,6 +11,8 @@
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
@@ -148,6 +150,66 @@ private:
         });
     }
 
+#if FLAME_ALERT_ENABLED
+    // Watches the flame sensor in the background and raises an alarm by itself.
+    // It never turns the fan on: moving air can make a fire bigger.
+    static void FlameMonitorTask(void* arg) {
+        // Let the device finish booting, joining Wi-Fi and activation first.
+        vTaskDelay(pdMS_TO_TICKS(20000));
+
+        int active_ticks = 0;
+        int clear_ticks = 0;
+        int ticks_since_alarm = 0;
+        bool fire = false;
+
+        while (true) {
+            bool detected = gpio_get_level(FLAME_GPIO) == FLAME_ACTIVE_LEVEL;
+            if (detected) {
+                active_ticks++;
+                clear_ticks = 0;
+            } else {
+                clear_ticks++;
+                active_ticks = 0;
+            }
+
+            if (!fire && active_ticks >= FLAME_CONFIRM_TICKS) {
+                fire = true;
+                ticks_since_alarm = 0;
+                ESP_LOGW(TAG, "FIRE detected by the flame sensor");
+                Application::GetInstance().Schedule([]() {
+                    Application::GetInstance().Alert("FIRE!", "FIRE DETECTED!", "angry",
+                                                     Lang::Sounds::OGG_EXCLAMATION);
+                });
+#if FLAME_ALERT_SPEAK_VIA_AI
+                // Give the alarm sound a moment, then ask the AI to speak a warning.
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                Application::GetInstance().WakeWordInvoke(FLAME_ALERT_AI_TEXT);
+#endif
+            } else if (fire && clear_ticks >= FLAME_CLEAR_TICKS) {
+                fire = false;
+                ESP_LOGI(TAG, "Flame sensor no longer sees a fire");
+                Application::GetInstance().Schedule([]() {
+                    Application::GetInstance().Alert("Info", "Flame gone", "neutral");
+                });
+            } else if (fire) {
+                ticks_since_alarm++;
+                if (ticks_since_alarm >= FLAME_REPEAT_TICKS) {
+                    ticks_since_alarm = 0;
+                    // Repeat only while idle, so we do not talk over a conversation.
+                    Application::GetInstance().Schedule([]() {
+                        auto& app = Application::GetInstance();
+                        if (app.GetDeviceState() == kDeviceStateIdle) {
+                            app.Alert("FIRE!", "FIRE DETECTED!", "angry",
+                                      Lang::Sounds::OGG_EXCLAMATION);
+                        }
+                    });
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+#endif
+
     // 物联网初始化，逐步迁移到 MCP 协议
     void InitializeTools() {
         static LampController lamp(LAMP_GPIO);
@@ -198,6 +260,10 @@ private:
                 bool detected = gpio_get_level(FLAME_GPIO) == FLAME_ACTIVE_LEVEL;
                 return detected ? "{\"flame_detected\": true}" : "{\"flame_detected\": false}";
             });
+
+#if FLAME_ALERT_ENABLED
+        xTaskCreate(FlameMonitorTask, "flame_monitor", 4096, nullptr, 3, nullptr);
+#endif
     }
 
 public:
