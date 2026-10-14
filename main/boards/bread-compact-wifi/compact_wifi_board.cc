@@ -9,8 +9,15 @@
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
+#include "settings.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <esp_rom_sys.h>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <string>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <driver/i2c_master.h>
@@ -23,6 +30,81 @@
 
 #define TAG "CompactWifiBoard"
 
+// ---------------------------------------------------------------------------
+// Shared state (fan, fire alarm, temperature rule)
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_fan_on{false};
+static std::atomic<bool> g_fan_auto_on{false};      // true when the temperature rule switched the fan on
+static std::atomic<bool> g_fire_active{false};      // true while the fire alarm is sounding
+static std::atomic<int>  g_fan_rule_celsius{0};     // 0 = no rule
+static std::atomic<bool> g_rule_latched{false};     // the rule already acted in this hot period
+static std::atomic<float> g_temp_c{NAN};
+static std::atomic<float> g_humidity{NAN};
+static std::atomic<int64_t> g_temp_time_us{0};
+
+static void SetFan(bool on) {
+    g_fan_on = on;
+    gpio_set_level(FAN_GPIO, on ? 1 : 0);
+}
+
+// Waits until the pin reaches `level`. Returns the time waited in microseconds, or -1 on timeout.
+static int WaitForLevel(gpio_num_t pin, int level, int timeout_us) {
+    int64_t start = esp_timer_get_time();
+    while (gpio_get_level(pin) != level) {
+        if (esp_timer_get_time() - start > timeout_us) {
+            return -1;
+        }
+    }
+    return (int)(esp_timer_get_time() - start);
+}
+
+// Reads an AM2302 / DHT22 sensor (one-wire protocol). Returns true on success.
+static bool ReadAm2302(gpio_num_t pin, float* temperature, float* humidity) {
+    static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    uint8_t data[5] = {0, 0, 0, 0, 0};
+
+    gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
+    gpio_set_direction(pin, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_level(pin, 0);
+    esp_rom_delay_us(2000);  // start signal: hold low for 2 ms
+
+    bool ok = true;
+    portENTER_CRITICAL(&mux);
+    gpio_set_level(pin, 1);  // release the line
+    if (WaitForLevel(pin, 0, 150) < 0 || WaitForLevel(pin, 1, 150) < 0 ||
+        WaitForLevel(pin, 0, 150) < 0) {
+        ok = false;
+    }
+    for (int i = 0; ok && i < 40; i++) {
+        if (WaitForLevel(pin, 1, 150) < 0) { ok = false; break; }
+        int high_us = WaitForLevel(pin, 0, 150);
+        if (high_us < 0) { ok = false; break; }
+        data[i / 8] <<= 1;
+        if (high_us > 40) {
+            data[i / 8] |= 1;
+        }
+    }
+    portEXIT_CRITICAL(&mux);
+
+    if (!ok) {
+        return false;
+    }
+    if (((data[0] + data[1] + data[2] + data[3]) & 0xFF) != data[4]) {
+        return false;
+    }
+    float h = ((data[0] << 8) | data[1]) / 10.0f;
+    float t = (((data[2] & 0x7F) << 8) | data[3]) / 10.0f;
+    if (data[2] & 0x80) {
+        t = -t;
+    }
+    if (h > 100.0f || t < -40.0f || t > 80.0f) {
+        return false;
+    }
+    *temperature = t;
+    *humidity = h;
+    return true;
+}
+
 class CompactWifiBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t display_i2c_bus_;
@@ -33,7 +115,6 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
-    bool fan_on_ = false;
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -175,6 +256,7 @@ private:
 
             if (!fire && active_ticks >= FLAME_CONFIRM_TICKS) {
                 fire = true;
+                g_fire_active = true;
                 ticks_since_voice = FLAME_REPEAT_TICKS;
                 ESP_LOGW(TAG, "FIRE detected by the flame sensor");
                 // Interrupt the AI if it is talking and drop the audio it queued.
@@ -186,6 +268,7 @@ private:
                 vTaskDelay(pdMS_TO_TICKS(500));
             } else if (fire && clear_ticks >= FLAME_CLEAR_TICKS) {
                 fire = false;
+                g_fire_active = false;
                 ESP_LOGI(TAG, "Flame sensor no longer sees a fire");
                 Application::GetInstance().Schedule([]() {
                     Application::GetInstance().Alert("Info", "Flame gone", "neutral");
@@ -208,6 +291,121 @@ private:
     }
 #endif
 
+#if GAS_ALERT_ENABLED
+    // Watches the gas / smoke sensor (MQ module, digital output). Same behaviour as the fire
+    // alarm: cuts off the AI and repeats a recorded voice warning until the gas is gone.
+    // It never switches the fan or any relay: a relay can make a spark.
+    static void GasMonitorTask(void* arg) {
+        // MQ sensors need time to heat up and give false readings at first.
+        vTaskDelay(pdMS_TO_TICKS(GAS_WARMUP_SECONDS * 1000));
+        ESP_LOGI(TAG, "Gas sensor is warm and armed");
+
+        int active_ticks = 0;
+        int clear_ticks = 0;
+        int ticks_since_voice = 0;
+        bool gas = false;
+
+        while (true) {
+            bool detected = gpio_get_level(GAS_GPIO) == GAS_ACTIVE_LEVEL;
+            if (detected) {
+                active_ticks++;
+                clear_ticks = 0;
+            } else {
+                clear_ticks++;
+                active_ticks = 0;
+            }
+
+            if (!gas && active_ticks >= GAS_CONFIRM_TICKS) {
+                gas = true;
+                ticks_since_voice = GAS_REPEAT_TICKS;
+                ESP_LOGW(TAG, "GAS or SMOKE detected by the gas sensor");
+                if (!g_fire_active) {
+                    Application::GetInstance().Schedule([]() {
+                        auto& app = Application::GetInstance();
+                        app.AbortSpeaking(kAbortReasonNone);
+                        app.GetAudioService().ResetDecoder();
+                    });
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+            } else if (gas && clear_ticks >= GAS_CLEAR_TICKS) {
+                gas = false;
+                ESP_LOGI(TAG, "Gas sensor no longer detects gas");
+                Application::GetInstance().Schedule([]() {
+                    Application::GetInstance().Alert("Info", "Gas gone", "neutral");
+                });
+            }
+
+            if (gas && detected && !g_fire_active) {
+                ticks_since_voice++;
+                if (ticks_since_voice >= GAS_REPEAT_TICKS) {
+                    ticks_since_voice = 0;
+                    Application::GetInstance().Schedule([]() {
+                        Application::GetInstance().Alert("GAS!", "GAS / SMOKE DETECTED!", "angry");
+                    });
+                    // Blocks until the voice has played.
+                    Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_GASALARM);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+#endif
+
+    // Reads the temperature sensor every few seconds and applies the fan rule that was set by voice.
+    static void TemperatureTask(void* arg) {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        int failures = 0;
+        while (true) {
+            float t = 0, h = 0;
+            bool ok = false;
+            for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+                ok = ReadAm2302(TEMP_GPIO, &t, &h);
+                if (!ok) {
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                }
+            }
+            if (ok) {
+                failures = 0;
+                g_temp_c = t;
+                g_humidity = h;
+                g_temp_time_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "Temperature %.1f C, humidity %.1f %%", t, h);
+
+                int threshold = g_fan_rule_celsius;
+                if (threshold > 0) {
+                    if (t >= threshold && !g_rule_latched) {
+                        g_rule_latched = true;
+                        if (!g_fan_on) {
+                            SetFan(true);
+                            g_fan_auto_on = true;
+                            ESP_LOGW(TAG, "Temperature rule: fan ON at %.1f C", t);
+                            Application::GetInstance().Schedule([t]() {
+                                char msg[40];
+                                snprintf(msg, sizeof(msg), "Fan ON: %.1f C", t);
+                                Application::GetInstance().Alert("Temperature", msg, "neutral");
+                            });
+                        }
+                    } else if (t <= threshold - TEMP_HYSTERESIS_C && g_rule_latched) {
+                        g_rule_latched = false;
+                        if (g_fan_auto_on && g_fan_on) {
+                            SetFan(false);
+                            ESP_LOGI(TAG, "Temperature rule: fan OFF at %.1f C", t);
+                            Application::GetInstance().Schedule([t]() {
+                                char msg[40];
+                                snprintf(msg, sizeof(msg), "Fan OFF: %.1f C", t);
+                                Application::GetInstance().Alert("Temperature", msg, "neutral");
+                            });
+                        }
+                        g_fan_auto_on = false;
+                    }
+                }
+            } else if (++failures == 5) {
+                ESP_LOGE(TAG, "Temperature sensor is not answering. Check the wiring on GPIO %d", (int)TEMP_GPIO);
+            }
+            vTaskDelay(pdMS_TO_TICKS(TEMP_READ_INTERVAL_MS));
+        }
+    }
+
     // 物联网初始化，逐步迁移到 MCP 协议
     void InitializeTools() {
         static LampController lamp(LAMP_GPIO);
@@ -224,22 +422,86 @@ private:
         gpio_set_level(FAN_GPIO, 0);
 
         auto& mcp_server = McpServer::GetInstance();
+        // Load the temperature rule that was saved by voice before the last restart.
+        {
+            Settings settings("temp_rule", false);
+            g_fan_rule_celsius = settings.GetInt("fan_on_at", 0);
+        }
+
         mcp_server.AddTool("self.fan.get_state", "Get the power state of the fan", PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
-                return fan_on_ ? "{\"power\": true}" : "{\"power\": false}";
+            [](const PropertyList& properties) -> ReturnValue {
+                return std::string(g_fan_on ? "{\"power\": true}" : "{\"power\": false}");
             });
         mcp_server.AddTool("self.fan.turn_on", "Turn on the fan", PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
-                fan_on_ = true;
-                gpio_set_level(FAN_GPIO, 1);
+            [](const PropertyList& properties) -> ReturnValue {
+                g_fan_auto_on = false;  // manual control: the temperature rule will not turn it off
+                SetFan(true);
                 return true;
             });
         mcp_server.AddTool("self.fan.turn_off", "Turn off the fan", PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
-                fan_on_ = false;
-                gpio_set_level(FAN_GPIO, 0);
+            [](const PropertyList& properties) -> ReturnValue {
+                g_fan_auto_on = false;
+                SetFan(false);
                 return true;
             });
+
+        // Temperature sensor (AM2302 / DHT22) and the voice-set fan rule
+        mcp_server.AddTool("self.temperature.get_state",
+            "Get the current room temperature in degrees Celsius and the humidity in percent",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                float t = g_temp_c;
+                float h = g_humidity;
+                if (std::isnan(t) || esp_timer_get_time() - g_temp_time_us > 30LL * 1000000) {
+                    return std::string("{\"error\": \"temperature sensor is not ready or not connected\"}");
+                }
+                char buf[96];
+                snprintf(buf, sizeof(buf), "{\"temperature_celsius\": %.1f, \"humidity_percent\": %.1f}", t, h);
+                return std::string(buf);
+            });
+        mcp_server.AddTool("self.temperature.set_fan_rule",
+            "Set an automatic fan rule: when the room temperature reaches or goes above the given "
+            "temperature in degrees Celsius, the fan turns on by itself, and it turns off again when the "
+            "room has cooled down by a degree. This replaces any earlier rule. Use it when the user says "
+            "things like 'turn on the fan when the temperature goes above 39'.",
+            PropertyList({Property("temperature", kPropertyTypeInteger, 10, 60)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                int threshold = properties["temperature"].value<int>();
+                g_fan_rule_celsius = threshold;
+                g_rule_latched = false;
+                {
+                    Settings settings("temp_rule", true);
+                    settings.SetInt("fan_on_at", threshold);
+                }
+                char buf[96];
+                snprintf(buf, sizeof(buf), "{\"success\": true, \"fan_turns_on_at_celsius\": %d}", threshold);
+                return std::string(buf);
+            });
+        mcp_server.AddTool("self.temperature.get_fan_rule",
+            "Get the automatic fan rule that is currently set (the temperature at which the fan turns on)",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                int threshold = g_fan_rule_celsius;
+                if (threshold <= 0) {
+                    return std::string("{\"rule_active\": false}");
+                }
+                char buf[96];
+                snprintf(buf, sizeof(buf), "{\"rule_active\": true, \"fan_turns_on_at_celsius\": %d}", threshold);
+                return std::string(buf);
+            });
+        mcp_server.AddTool("self.temperature.clear_fan_rule",
+            "Remove the automatic temperature rule for the fan",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                g_fan_rule_celsius = 0;
+                g_rule_latched = false;
+                {
+                    Settings settings("temp_rule", true);
+                    settings.SetInt("fan_on_at", 0);
+                }
+                return std::string("{\"success\": true, \"rule_active\": false}");
+            });
+        xTaskCreate(TemperatureTask, "temp_monitor", 4096, nullptr, 3, nullptr);
 
         // Flame sensor (digital output, read on demand)
         gpio_config_t flame_config = {
@@ -261,6 +523,25 @@ private:
 
 #if FLAME_ALERT_ENABLED
         xTaskCreate(FlameMonitorTask, "flame_monitor", 4096, nullptr, 3, nullptr);
+#endif
+
+#if GAS_ALERT_ENABLED
+        gpio_config_t gas_config = {
+            .pin_bit_mask = (1ULL << GAS_GPIO),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&gas_config));
+        mcp_server.AddTool("self.gas.get_state",
+            "Check the gas and smoke sensor. Returns whether gas or smoke is currently detected",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                bool detected = gpio_get_level(GAS_GPIO) == GAS_ACTIVE_LEVEL;
+                return std::string(detected ? "{\"gas_detected\": true}" : "{\"gas_detected\": false}");
+            });
+        xTaskCreate(GasMonitorTask, "gas_monitor", 4096, nullptr, 3, nullptr);
 #endif
     }
 

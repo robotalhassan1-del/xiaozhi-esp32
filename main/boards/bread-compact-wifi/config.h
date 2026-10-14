@@ -75,4 +75,23 @@
 // Pause between voice warnings while the fire lasts (10 = 1 second after each warning ends).
 #define FLAME_REPEAT_TICKS 10
 
+
+// Temperature sensor: AM2302 / DHT22 (red = 3.3V, black = GND, yellow = DATA).
+// A 4.7k-10k resistor between DATA and 3.3V is recommended.
+#define TEMP_GPIO GPIO_NUM_9
+#define TEMP_READ_INTERVAL_MS 3000
+// The fan turns off again when the temperature drops this many degrees below the rule.
+#define TEMP_HYSTERESIS_C 1
+
+// Gas / smoke sensor: MQ module powered from 3.3V, DO pin (LOW = gas detected on most modules).
+// If your module does the opposite, change GAS_ACTIVE_LEVEL to 1.
+#define GAS_GPIO GPIO_NUM_10
+#define GAS_ACTIVE_LEVEL 0
+#define GAS_ALERT_ENABLED 1
+// MQ sensors need time to heat up. The alarm is switched on only after this many seconds.
+#define GAS_WARMUP_SECONDS 120
+#define GAS_CONFIRM_TICKS 5
+#define GAS_CLEAR_TICKS 30
+#define GAS_REPEAT_TICKS 10
+
 #endif // _BOARD_CONFIG_H_
