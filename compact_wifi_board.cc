@@ -151,15 +151,16 @@ private:
     }
 
 #if FLAME_ALERT_ENABLED
-    // Watches the flame sensor in the background and raises an alarm by itself.
-    // It never turns the fan on: moving air can make a fire bigger.
+    // Watches the flame sensor in the background. When a fire is seen it cuts off whatever
+    // the AI is saying and plays a recorded male voice warning, again and again, until the
+    // fire is gone. It never turns the fan on: moving air can make a fire bigger.
     static void FlameMonitorTask(void* arg) {
         // Let the device finish booting, joining Wi-Fi and activation first.
         vTaskDelay(pdMS_TO_TICKS(20000));
 
         int active_ticks = 0;
         int clear_ticks = 0;
-        int ticks_since_alarm = 0;
+        int ticks_since_voice = 0;
         bool fire = false;
 
         while (true) {
@@ -174,35 +175,32 @@ private:
 
             if (!fire && active_ticks >= FLAME_CONFIRM_TICKS) {
                 fire = true;
-                ticks_since_alarm = 0;
+                ticks_since_voice = FLAME_REPEAT_TICKS;
                 ESP_LOGW(TAG, "FIRE detected by the flame sensor");
+                // Interrupt the AI if it is talking and drop the audio it queued.
                 Application::GetInstance().Schedule([]() {
-                    Application::GetInstance().Alert("FIRE!", "FIRE DETECTED!", "angry",
-                                                     Lang::Sounds::OGG_EXCLAMATION);
+                    auto& app = Application::GetInstance();
+                    app.AbortSpeaking(kAbortReasonNone);
+                    app.GetAudioService().ResetDecoder();
                 });
-#if FLAME_ALERT_SPEAK_VIA_AI
-                // Give the alarm sound a moment, then ask the AI to speak a warning.
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                Application::GetInstance().WakeWordInvoke(FLAME_ALERT_AI_TEXT);
-#endif
+                vTaskDelay(pdMS_TO_TICKS(500));
             } else if (fire && clear_ticks >= FLAME_CLEAR_TICKS) {
                 fire = false;
                 ESP_LOGI(TAG, "Flame sensor no longer sees a fire");
                 Application::GetInstance().Schedule([]() {
                     Application::GetInstance().Alert("Info", "Flame gone", "neutral");
                 });
-            } else if (fire) {
-                ticks_since_alarm++;
-                if (ticks_since_alarm >= FLAME_REPEAT_TICKS) {
-                    ticks_since_alarm = 0;
-                    // Repeat only while idle, so we do not talk over a conversation.
+            }
+
+            if (fire && detected) {
+                ticks_since_voice++;
+                if (ticks_since_voice >= FLAME_REPEAT_TICKS) {
+                    ticks_since_voice = 0;
                     Application::GetInstance().Schedule([]() {
-                        auto& app = Application::GetInstance();
-                        if (app.GetDeviceState() == kDeviceStateIdle) {
-                            app.Alert("FIRE!", "FIRE DETECTED!", "angry",
-                                      Lang::Sounds::OGG_EXCLAMATION);
-                        }
+                        Application::GetInstance().Alert("FIRE!", "FIRE DETECTED!", "angry");
                     });
+                    // Blocks until the voice has played (about 8 seconds).
+                    Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_FIREALARM);
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(100));
