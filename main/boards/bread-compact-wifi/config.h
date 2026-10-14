@@ -76,8 +76,11 @@
 #define FLAME_REPEAT_TICKS 10
 
 
-// Temperature sensor: AM2302 / DHT22 (red = 3.3V, black = GND, yellow = DATA).
+// Temperature sensor (red = 3.3V, black = GND, yellow = DATA).
 // A 4.7k-10k resistor between DATA and 3.3V is recommended.
+// Sensor type: 1 = DHT11 (blue sensor, whole degrees, about +/-2 C), 0 = DHT22 / AM2302.
+#define TEMP_SENSOR_DHT11 1
+#define TEMP_START_US (TEMP_SENSOR_DHT11 ? 20000 : 2000)
 #define TEMP_GPIO GPIO_NUM_9
 #define TEMP_READ_INTERVAL_MS 3000
 // The fan turns off again when the temperature drops this many degrees below the rule.

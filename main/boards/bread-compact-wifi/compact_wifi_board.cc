@@ -58,27 +58,32 @@ static int WaitForLevel(gpio_num_t pin, int level, int timeout_us) {
     return (int)(esp_timer_get_time() - start);
 }
 
-// Reads an AM2302 / DHT22 sensor (one-wire protocol). Returns true on success.
-static bool ReadAm2302(gpio_num_t pin, float* temperature, float* humidity) {
+// Reads a DHT11 or AM2302 / DHT22 sensor (one-wire protocol). Returns true on success.
+static bool ReadAm2302(gpio_num_t pin, float* temperature, float* humidity, int* stage) {
+    *stage = 0;
     static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
     uint8_t data[5] = {0, 0, 0, 0, 0};
 
+    gpio_reset_pin(pin);  // make sure the pin is a plain GPIO
     gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
     gpio_set_direction(pin, GPIO_MODE_INPUT_OUTPUT_OD);
     gpio_set_level(pin, 0);
-    esp_rom_delay_us(2000);  // start signal: hold low for 2 ms
+    esp_rom_delay_us(TEMP_START_US);  // start signal: DHT11 needs >= 18 ms low, DHT22 only 1 ms
 
     bool ok = true;
     portENTER_CRITICAL(&mux);
     gpio_set_level(pin, 1);  // release the line
-    if (WaitForLevel(pin, 0, 150) < 0 || WaitForLevel(pin, 1, 150) < 0 ||
-        WaitForLevel(pin, 0, 150) < 0) {
-        ok = false;
+    if (WaitForLevel(pin, 0, 150) < 0) {
+        ok = false; *stage = 1;      // the sensor never answered (nothing connected / wrong pin)
+    } else if (WaitForLevel(pin, 1, 150) < 0) {
+        ok = false; *stage = 2;      // the line is stuck low
+    } else if (WaitForLevel(pin, 0, 150) < 0) {
+        ok = false; *stage = 3;
     }
     for (int i = 0; ok && i < 40; i++) {
-        if (WaitForLevel(pin, 1, 150) < 0) { ok = false; break; }
+        if (WaitForLevel(pin, 1, 150) < 0) { ok = false; *stage = 4; break; }
         int high_us = WaitForLevel(pin, 0, 150);
-        if (high_us < 0) { ok = false; break; }
+        if (high_us < 0) { ok = false; *stage = 4; break; }
         data[i / 8] <<= 1;
         if (high_us > 40) {
             data[i / 8] |= 1;
@@ -90,14 +95,25 @@ static bool ReadAm2302(gpio_num_t pin, float* temperature, float* humidity) {
         return false;
     }
     if (((data[0] + data[1] + data[2] + data[3]) & 0xFF) != data[4]) {
+        *stage = 5;                  // data arrived but is corrupted
         return false;
     }
+#if TEMP_SENSOR_DHT11
+    // DHT11: whole degrees in byte 2 (some versions add tenths in byte 3).
+    float h = data[0] + (data[1] & 0x0F) / 10.0f;
+    float t = data[2] + (data[3] & 0x0F) / 10.0f;
+    if (data[3] & 0x80) {
+        t = -t;
+    }
+#else
     float h = ((data[0] << 8) | data[1]) / 10.0f;
     float t = (((data[2] & 0x7F) << 8) | data[3]) / 10.0f;
     if (data[2] & 0x80) {
         t = -t;
     }
+#endif
     if (h > 100.0f || t < -40.0f || t > 80.0f) {
+        *stage = 6;
         return false;
     }
     *temperature = t;
@@ -358,8 +374,9 @@ private:
         while (true) {
             float t = 0, h = 0;
             bool ok = false;
+            int stage = 0;
             for (int attempt = 0; attempt < 3 && !ok; attempt++) {
-                ok = ReadAm2302(TEMP_GPIO, &t, &h);
+                ok = ReadAm2302(TEMP_GPIO, &t, &h, &stage);
                 if (!ok) {
                     vTaskDelay(pdMS_TO_TICKS(300));
                 }
@@ -399,8 +416,8 @@ private:
                         g_fan_auto_on = false;
                     }
                 }
-            } else if (++failures == 5) {
-                ESP_LOGE(TAG, "Temperature sensor is not answering. Check the wiring on GPIO %d", (int)TEMP_GPIO);
+            } else if (++failures % 5 == 0) {
+                ESP_LOGE(TAG, "Temperature sensor error, stage %d (1 = no answer, 2 = line stuck low, 4/5 = bad data). Check the wiring on GPIO %d", stage, (int)TEMP_GPIO);
             }
             vTaskDelay(pdMS_TO_TICKS(TEMP_READ_INTERVAL_MS));
         }
