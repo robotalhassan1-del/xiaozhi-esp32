@@ -20,6 +20,7 @@
 #include <string>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
@@ -41,6 +42,84 @@ static std::atomic<bool> g_rule_latched{false};     // the rule already acted in
 static std::atomic<float> g_temp_c{NAN};
 static std::atomic<float> g_humidity{NAN};
 static std::atomic<int64_t> g_temp_time_us{0};
+
+
+// ---------------------------------------------------------------------------
+// Phone notifications through ntfy (https://ntfy.sh). Messages are queued by the alarm
+// tasks and sent by a separate task, so a slow network never delays an alarm.
+// ---------------------------------------------------------------------------
+struct NotifyMessage {
+    char title[48];
+    char body[160];
+    char tags[48];
+    int priority;
+};
+static QueueHandle_t g_notify_queue = nullptr;
+
+static void QueueNotify(const char* title, const char* body, const char* tags, int priority) {
+#if NOTIFY_ENABLED
+    if (g_notify_queue == nullptr) {
+        return;
+    }
+    NotifyMessage m = {};
+    snprintf(m.title, sizeof(m.title), "%s", title);
+    snprintf(m.body, sizeof(m.body), "%s", body);
+    snprintf(m.tags, sizeof(m.tags), "%s", tags);
+    m.priority = priority;
+    xQueueSend(g_notify_queue, &m, 0);  // never wait: if the queue is full the message is dropped
+#endif
+}
+
+#if NOTIFY_ENABLED
+static bool SendNtfy(const NotifyMessage& m) {
+    auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        return false;
+    }
+    auto http = network->CreateHttp(0);
+    if (!http) {
+        return false;
+    }
+    http->SetTimeout(10000);
+    http->SetHeader("Title", m.title);
+    http->SetHeader("Priority", std::to_string(m.priority));
+    http->SetHeader("Tags", m.tags);
+    http->SetHeader("Content-Type", "text/plain");
+    http->SetContent(std::string(m.body));
+
+    std::string url = std::string(NOTIFY_SERVER) + "/" + NOTIFY_TOPIC;
+    auto opened = http->Open("POST", url);
+    if (!opened) {
+        ESP_LOGE(TAG, "Notification: cannot connect: %s", opened.error().ToString().c_str());
+        return false;
+    }
+    auto status = http->GetStatusCode();
+    bool ok = status && *status >= 200 && *status < 300;
+    if (!ok) {
+        ESP_LOGE(TAG, "Notification: server answered with status %d", status ? *status : -1);
+    }
+    http->ReadAll();
+    http->Close();
+    return ok;
+}
+
+static void NotifyTask(void* arg) {
+    NotifyMessage m;
+    while (true) {
+        if (xQueueReceive(g_notify_queue, &m, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        bool ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            ok = SendNtfy(m);
+            if (!ok) {
+                vTaskDelay(pdMS_TO_TICKS(5000));
+            }
+        }
+        ESP_LOGI(TAG, "Notification \"%s\": %s", m.title, ok ? "sent" : "FAILED");
+    }
+}
+#endif
 
 static void SetFan(bool on) {
     g_fan_on = on;
@@ -258,6 +337,7 @@ private:
         int active_ticks = 0;
         int clear_ticks = 0;
         int ticks_since_voice = 0;
+        int64_t last_notify_us = 0;
         bool fire = false;
 
         while (true) {
@@ -274,6 +354,9 @@ private:
                 fire = true;
                 g_fire_active = true;
                 ticks_since_voice = FLAME_REPEAT_TICKS;
+                last_notify_us = esp_timer_get_time();
+                QueueNotify("FIRE ALERT", "Fire detected by the robot's flame sensor. Check the house now!",
+                            "fire,rotating_light", 5);
                 ESP_LOGW(TAG, "FIRE detected by the flame sensor");
                 // Interrupt the AI if it is talking and drop the audio it queued.
                 Application::GetInstance().Schedule([]() {
@@ -286,11 +369,18 @@ private:
                 fire = false;
                 g_fire_active = false;
                 ESP_LOGI(TAG, "Flame sensor no longer sees a fire");
+                QueueNotify("Fire cleared", "The flame sensor no longer sees a fire.", "white_check_mark", 3);
                 Application::GetInstance().Schedule([]() {
                     Application::GetInstance().Alert("Info", "Flame gone", "neutral");
                 });
             }
 
+            if (fire && detected &&
+                esp_timer_get_time() - last_notify_us > (int64_t)NOTIFY_REPEAT_SECONDS * 1000000) {
+                last_notify_us = esp_timer_get_time();
+                QueueNotify("FIRE ALERT (still burning)", "The flame sensor still sees a fire!",
+                            "fire,rotating_light", 5);
+            }
             if (fire && detected) {
                 ticks_since_voice++;
                 if (ticks_since_voice >= FLAME_REPEAT_TICKS) {
@@ -319,6 +409,7 @@ private:
         int active_ticks = 0;
         int clear_ticks = 0;
         int ticks_since_voice = 0;
+        int64_t last_notify_us = 0;
         bool gas = false;
 
         while (true) {
@@ -334,6 +425,9 @@ private:
             if (!gas && active_ticks >= GAS_CONFIRM_TICKS) {
                 gas = true;
                 ticks_since_voice = GAS_REPEAT_TICKS;
+                last_notify_us = esp_timer_get_time();
+                QueueNotify("GAS / SMOKE ALERT", "Gas or smoke detected by the robot's gas sensor. Open windows, avoid flames and switches!",
+                            "warning,skull", 5);
                 ESP_LOGW(TAG, "GAS or SMOKE detected by the gas sensor");
                 if (!g_fire_active) {
                     Application::GetInstance().Schedule([]() {
@@ -346,11 +440,18 @@ private:
             } else if (gas && clear_ticks >= GAS_CLEAR_TICKS) {
                 gas = false;
                 ESP_LOGI(TAG, "Gas sensor no longer detects gas");
+                QueueNotify("Gas cleared", "The gas sensor no longer detects gas or smoke.", "white_check_mark", 3);
                 Application::GetInstance().Schedule([]() {
                     Application::GetInstance().Alert("Info", "Gas gone", "neutral");
                 });
             }
 
+            if (gas && detected &&
+                esp_timer_get_time() - last_notify_us > (int64_t)NOTIFY_REPEAT_SECONDS * 1000000) {
+                last_notify_us = esp_timer_get_time();
+                QueueNotify("GAS / SMOKE ALERT (still)", "The gas sensor still detects gas or smoke!",
+                            "warning,skull", 5);
+            }
             if (gas && detected && !g_fire_active) {
                 ticks_since_voice++;
                 if (ticks_since_voice >= GAS_REPEAT_TICKS) {
@@ -461,6 +562,19 @@ private:
                 SetFan(false);
                 return true;
             });
+
+#if NOTIFY_ENABLED
+        g_notify_queue = xQueueCreate(4, sizeof(NotifyMessage));
+        xTaskCreate(NotifyTask, "notify", 6144, nullptr, 2, nullptr);
+        mcp_server.AddTool("self.notify.send_test",
+            "Send a test notification to the owner's phone to check that phone alerts work",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                QueueNotify("Robot test", "This is a test message from your robot. Phone alerts work!",
+                            "robot", 3);
+                return std::string("{\"success\": true, \"note\": \"the test message is being sent\"}");
+            });
+#endif
 
         // Temperature sensor (AM2302 / DHT22) and the voice-set fan rule
         mcp_server.AddTool("self.temperature.get_state",

@@ -97,4 +97,13 @@
 #define GAS_CLEAR_TICKS 30
 #define GAS_REPEAT_TICKS 10
 
+
+// Phone notifications (ntfy). The same TOPIC must be subscribed in the ntfy app on your phone.
+// The topic acts like a password: keep it long and random, and do not share it.
+#define NOTIFY_ENABLED 1
+#define NOTIFY_SERVER "https://ntfy.sh"
+#define NOTIFY_TOPIC "alhassan-robot-6fkgyrcpwhstre"
+// While a fire or gas alarm continues, a new message is sent every this many seconds.
+#define NOTIFY_REPEAT_SECONDS 120
+
 #endif // _BOARD_CONFIG_H_
