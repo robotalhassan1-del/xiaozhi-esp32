@@ -11,6 +11,13 @@
 #include "assets/lang_config.h"
 #include "settings.h"
 
+// Short attention sound played at once when a danger is found, while the AI is still connecting.
+#if AI_ALERT_ENABLED
+#define ALERT_ATTN_SOUND Lang::Sounds::OGG_EXCLAMATION
+#else
+#define ALERT_ATTN_SOUND ""
+#endif
+
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_rom_sys.h>
@@ -419,7 +426,7 @@ private:
                 if (ticks_since_voice >= FLAME_REPEAT_TICKS) {
                     ticks_since_voice = 0;
                     Application::GetInstance().Schedule([]() {
-                        Application::GetInstance().Alert("FIRE!", "FIRE DETECTED!", "angry", Lang::Sounds::OGG_EXCLAMATION);
+                        Application::GetInstance().Alert("FIRE!", "FIRE DETECTED!", "angry", ALERT_ATTN_SOUND);
                     });
 #if AI_ALERT_ENABLED
                     // The AI speaks the warning. If it cannot (no internet, server asleep), the
@@ -502,7 +509,7 @@ private:
                 if (ticks_since_voice >= GAS_REPEAT_TICKS) {
                     ticks_since_voice = 0;
                     Application::GetInstance().Schedule([]() {
-                        Application::GetInstance().Alert("GAS!", "GAS / SMOKE DETECTED!", "angry", Lang::Sounds::OGG_EXCLAMATION);
+                        Application::GetInstance().Alert("GAS!", "GAS / SMOKE DETECTED!", "angry", ALERT_ATTN_SOUND);
                     });
 #if AI_ALERT_ENABLED
                     int r = AiAlarm("ALERT_GAS");

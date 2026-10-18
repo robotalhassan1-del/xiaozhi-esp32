@@ -98,11 +98,11 @@
 #define GAS_REPEAT_TICKS 10
 
 
-// Danger warnings spoken by the AI (Gemini, Hausa) instead of the recorded voice.
+// Danger warnings: 0 = recorded voice (instant, works offline), 1 = spoken by the AI (Gemini, Hausa).
 // The robot asks the server to speak; if that fails within 12 s (no Wi-Fi, server asleep),
 // the recorded voice (firealarm.ogg / gasalarm.ogg) plays instead, so the alarm is never silent.
 // AI_ALERT_GAP_TICKS: pause between spoken warnings while the danger lasts (30 = 3 s).
-#define AI_ALERT_ENABLED 1
+#define AI_ALERT_ENABLED 0
 #define AI_ALERT_GAP_TICKS 30
 
 // Phone notifications (ntfy). The same TOPIC must be subscribed in the ntfy app on your phone.
