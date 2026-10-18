@@ -419,7 +419,7 @@ private:
                 if (ticks_since_voice >= FLAME_REPEAT_TICKS) {
                     ticks_since_voice = 0;
                     Application::GetInstance().Schedule([]() {
-                        Application::GetInstance().Alert("FIRE!", "FIRE DETECTED!", "angry");
+                        Application::GetInstance().Alert("FIRE!", "FIRE DETECTED!", "angry", Lang::Sounds::OGG_EXCLAMATION);
                     });
 #if AI_ALERT_ENABLED
                     // The AI speaks the warning. If it cannot (no internet, server asleep), the
@@ -502,7 +502,7 @@ private:
                 if (ticks_since_voice >= GAS_REPEAT_TICKS) {
                     ticks_since_voice = 0;
                     Application::GetInstance().Schedule([]() {
-                        Application::GetInstance().Alert("GAS!", "GAS / SMOKE DETECTED!", "angry");
+                        Application::GetInstance().Alert("GAS!", "GAS / SMOKE DETECTED!", "angry", Lang::Sounds::OGG_EXCLAMATION);
                     });
 #if AI_ALERT_ENABLED
                     int r = AiAlarm("ALERT_GAS");
