@@ -49,6 +49,11 @@ static std::atomic<bool> g_rule_latched{false};     // the rule already acted in
 static std::atomic<float> g_temp_c{NAN};
 static std::atomic<float> g_humidity{NAN};
 static std::atomic<int64_t> g_temp_time_us{0};
+static std::atomic<bool> g_lamp_on{false};
+static std::atomic<bool> g_pir_mode{false};         // motion-light mode: motion turns the lamp on, calm turns it off
+static std::atomic<int>  g_pir_off_seconds{60};     // lamp goes off after this many seconds without motion
+static std::atomic<int64_t> g_last_motion_us{0};
+static std::atomic<bool> g_motion_now{false};
 
 
 // ---------------------------------------------------------------------------
@@ -131,6 +136,11 @@ static void NotifyTask(void* arg) {
 static void SetFan(bool on) {
     g_fan_on = on;
     gpio_set_level(FAN_GPIO, on ? 1 : 0);
+}
+
+static void SetLamp(bool on) {
+    g_lamp_on = on;
+    gpio_set_level(LAMP_GPIO, on ? 1 : 0);
 }
 
 // Waits until the pin reaches `level`. Returns the time waited in microseconds, or -1 on timeout.
@@ -531,6 +541,31 @@ private:
 #endif
 
     // Reads the temperature sensor every few seconds and applies the fan rule that was set by voice.
+    // Motion sensor (PIR). While the motion-light mode is on, any movement turns the lamp on and
+    // the lamp turns off again after the set number of seconds without movement. Works without the server.
+    static void PirTask(void* arg) {
+        vTaskDelay(pdMS_TO_TICKS(PIR_WARMUP_SECONDS * 1000));  // the sensor needs time to settle
+        ESP_LOGI(TAG, "Motion sensor is ready");
+        while (true) {
+            bool motion = gpio_get_level(PIR_GPIO) == PIR_ACTIVE_LEVEL;
+            g_motion_now = motion;
+            if (motion) {
+                g_last_motion_us = esp_timer_get_time();
+            }
+            if (g_pir_mode) {
+                if (motion && !g_lamp_on) {
+                    SetLamp(true);
+                    ESP_LOGI(TAG, "Motion: lamp ON");
+                } else if (!motion && g_lamp_on &&
+                           esp_timer_get_time() - g_last_motion_us > (int64_t)g_pir_off_seconds * 1000000) {
+                    SetLamp(false);
+                    ESP_LOGI(TAG, "No motion for %d s: lamp OFF", (int)g_pir_off_seconds);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
     static void TemperatureTask(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(3000));
         int failures = 0;
@@ -588,7 +623,16 @@ private:
 
     // 物联网初始化，逐步迁移到 MCP 协议
     void InitializeTools() {
-        static LampController lamp(LAMP_GPIO);
+        // Lamp relay (own tools, so the motion light can switch it and the state stays correct)
+        gpio_config_t lamp_config = {
+            .pin_bit_mask = (1ULL << LAMP_GPIO),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&lamp_config));
+        SetLamp(false);
 
         // Fan relay
         gpio_config_t fan_config = {
@@ -607,6 +651,80 @@ private:
             Settings settings("temp_rule", false);
             g_fan_rule_celsius = settings.GetInt("fan_on_at", 0);
         }
+
+        mcp_server.AddTool("self.lamp.get_state", "Get the power state of the lamp", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                return std::string(g_lamp_on ? "{\"power\": true}" : "{\"power\": false}");
+            });
+        mcp_server.AddTool("self.lamp.turn_on", "Turn on the lamp", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                SetLamp(true);
+                return true;
+            });
+        mcp_server.AddTool("self.lamp.turn_off", "Turn off the lamp", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                SetLamp(false);
+                return true;
+            });
+
+        // Motion sensor (PIR) and the voice-set motion-light mode
+        gpio_config_t pir_config = {
+            .pin_bit_mask = (1ULL << PIR_GPIO),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_ENABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&pir_config));
+        {
+            Settings settings("motion_light", false);
+            g_pir_mode = settings.GetInt("on", 0) != 0;
+            g_pir_off_seconds = settings.GetInt("secs", PIR_DEFAULT_OFF_SECONDS);
+        }
+        g_last_motion_us = esp_timer_get_time();
+        mcp_server.AddTool("self.motion_light.turn_on",
+            "Turn on the motion-light mode: whenever the motion sensor sees movement, the lamp turns on by "
+            "itself, and when there is no movement for the given number of seconds, the lamp turns off again. "
+            "Use it when the user says things like 'turn on the lamp whenever you sense motion'. "
+            "Optional: seconds = how long without movement before the lamp turns off (default 60).",
+            PropertyList({Property("seconds", kPropertyTypeInteger, PIR_DEFAULT_OFF_SECONDS, 5, 3600)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                int secs = properties["seconds"].value<int>();
+                g_pir_off_seconds = secs;
+                g_last_motion_us = esp_timer_get_time();
+                g_pir_mode = true;
+                {
+                    Settings settings("motion_light", true);
+                    settings.SetInt("on", 1);
+                    settings.SetInt("secs", secs);
+                }
+                char buf[96];
+                snprintf(buf, sizeof(buf), "{\"success\": true, \"motion_light\": true, \"off_after_seconds\": %d}", secs);
+                return std::string(buf);
+            });
+        mcp_server.AddTool("self.motion_light.turn_off",
+            "Turn off the motion-light mode. The lamp then obeys only direct commands and stays as it is now.",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                g_pir_mode = false;
+                {
+                    Settings settings("motion_light", true);
+                    settings.SetInt("on", 0);
+                }
+                return std::string("{\"success\": true, \"motion_light\": false}");
+            });
+        mcp_server.AddTool("self.motion_light.get_state",
+            "Get the motion-light mode (on or off), how many seconds without movement turn the lamp off, "
+            "and whether movement is detected right now",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                         "{\"motion_light\": %s, \"off_after_seconds\": %d, \"motion_detected_now\": %s}",
+                         g_pir_mode ? "true" : "false", (int)g_pir_off_seconds, g_motion_now ? "true" : "false");
+                return std::string(buf);
+            });
+        xTaskCreate(PirTask, "pir_monitor", 3072, nullptr, 3, nullptr);
 
         mcp_server.AddTool("self.fan.get_state", "Get the power state of the fan", PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {

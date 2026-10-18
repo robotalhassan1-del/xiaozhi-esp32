@@ -105,6 +105,16 @@
 #define AI_ALERT_ENABLED 0
 #define AI_ALERT_GAP_TICKS 30
 
+// Motion sensor (PIR, e.g. HC-SR501): VCC to 5V (VIN) or 3.3V, GND to GND, OUT to this pin.
+// The module's two small knobs: turn the time knob (Tx) fully left (shortest hold) and put the
+// jumper on H (repeat trigger). Warm-up: the sensor gives false readings for the first seconds.
+#define PIR_GPIO GPIO_NUM_11
+#define PIR_ACTIVE_LEVEL 1
+#define PIR_WARMUP_SECONDS 30
+// Default time without movement before the lamp turns off (voice can change it, 5 - 3600 s).
+#define PIR_DEFAULT_OFF_SECONDS 60
+
+
 // Phone notifications (ntfy). The same TOPIC must be subscribed in the ntfy app on your phone.
 // The topic acts like a password: keep it long and random, and do not share it.
 #define NOTIFY_ENABLED 1
