@@ -326,6 +326,39 @@ private:
         });
     }
 
+#if AI_ALERT_ENABLED
+    // Asks the AI (robot -> server -> Gemini) to speak a danger warning in its own voice.
+    // The word "ALERT_FIRE" / "ALERT_GAS" is sent to the server like a wake word; the server
+    // turns it into an urgent instruction for Gemini.
+    // Returns  1 = the AI spoke the warning,
+    //          0 = it did not start speaking in time (no Wi-Fi / server asleep / Gemini down),
+    //         -1 = the robot was busy connecting, try again in a moment.
+    static int AiAlarm(const char* key) {
+        auto& app = Application::GetInstance();
+        DeviceState s = app.GetDeviceState();
+        if (s == kDeviceStateListening || s == kDeviceStateSpeaking || s == kDeviceStateNotifying) {
+            // Close the open conversation (or stop the speech) so a fresh one can start with the alert.
+            app.WakeWordInvoke(key);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            s = app.GetDeviceState();
+        }
+        if (s != kDeviceStateIdle) {
+            return -1;
+        }
+        app.WakeWordInvoke(key);
+        for (int i = 0; i < 120; i++) {  // wait up to 12 s for the AI to start speaking
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (app.GetDeviceState() == kDeviceStateSpeaking) {
+                for (int j = 0; j < 400 && app.GetDeviceState() == kDeviceStateSpeaking; j++) {
+                    vTaskDelay(pdMS_TO_TICKS(100));  // let it finish (max 40 s)
+                }
+                return 1;
+            }
+        }
+        return 0;
+    }
+#endif
+
 #if FLAME_ALERT_ENABLED
     // Watches the flame sensor in the background. When a fire is seen it cuts off whatever
     // the AI is saying and plays a recorded male voice warning, again and again, until the
@@ -388,8 +421,20 @@ private:
                     Application::GetInstance().Schedule([]() {
                         Application::GetInstance().Alert("FIRE!", "FIRE DETECTED!", "angry");
                     });
+#if AI_ALERT_ENABLED
+                    // The AI speaks the warning. If it cannot (no internet, server asleep), the
+                    // recorded voice is played instead, so the alarm never stays silent.
+                    int r = AiAlarm("ALERT_FIRE");
+                    if (r == 0) {
+                        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_FIREALARM);
+                    }
+                    if (r != -1) {
+                        ticks_since_voice = FLAME_REPEAT_TICKS - AI_ALERT_GAP_TICKS;
+                    }
+#else
                     // Blocks until the voice has played (about 8 seconds).
                     Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_FIREALARM);
+#endif
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -459,8 +504,18 @@ private:
                     Application::GetInstance().Schedule([]() {
                         Application::GetInstance().Alert("GAS!", "GAS / SMOKE DETECTED!", "angry");
                     });
+#if AI_ALERT_ENABLED
+                    int r = AiAlarm("ALERT_GAS");
+                    if (r == 0) {
+                        Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_GASALARM);
+                    }
+                    if (r != -1) {
+                        ticks_since_voice = GAS_REPEAT_TICKS - AI_ALERT_GAP_TICKS;
+                    }
+#else
                     // Blocks until the voice has played.
                     Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_GASALARM);
+#endif
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(100));
