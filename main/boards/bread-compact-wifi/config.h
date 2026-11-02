@@ -129,9 +129,12 @@
 #define EYE_GREEN_GPIO GPIO_NUM_13
 #define EYE_BLUE_GPIO  GPIO_NUM_12
 #define EYE_RED_LEVEL  0.8f
-#define EYE_GREEN_DIM  0.18f
+#define EYE_RED_IDLE   1.0f   // red, full brightness, while waiting for the wake word
 #define EYE_GREEN_FULL 1.0f
-#define EYE_BLUE_DIM   0.18f
+#define EYE_BLUE_DIM   0.45f
 #define EYE_BLUE_FULL  1.0f
+
+// Away mode: seconds the robot waits after "I am leaving" before it starts watching.
+#define AWAY_LEAVE_DELAY_SECONDS 60
 
 #endif // _BOARD_CONFIG_H_

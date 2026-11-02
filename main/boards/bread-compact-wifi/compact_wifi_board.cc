@@ -58,6 +58,15 @@ static std::atomic<bool> g_pir_mode{false};         // motion-light mode: motion
 static std::atomic<int>  g_pir_off_seconds{60};     // lamp goes off after this many seconds without motion
 static std::atomic<int64_t> g_last_motion_us{0};
 static std::atomic<bool> g_motion_now{false};
+// Eyes controlled by voice (AI): colour in percent, effect 0 = solid, 1 = blink, 2 = breathe, 3 = rainbow.
+static std::atomic<int> g_eye_r{0}, g_eye_g{0}, g_eye_b{0};
+static std::atomic<int> g_eye_effect{0};
+static std::atomic<int64_t> g_eye_override_until_us{0};
+// Away mode: the motion sensor watches the house and a phone message is sent when it sees movement.
+static std::atomic<bool> g_away_mode{false};
+static std::atomic<int64_t> g_away_armed_us{0};      // the watch starts at this time (leaving delay)
+static std::atomic<int64_t> g_intruder_until_us{0};  // red slow blink until this time
+static std::atomic<int64_t> g_last_away_notify_us{0};
 
 
 // ---------------------------------------------------------------------------
@@ -224,12 +233,14 @@ static bool ReadAm2302(gpio_num_t pin, float* temperature, float* humidity, int*
 // ---------------------------------------------------------------------------
 // Eyes: red, green and blue LEDs (each colour on one pin, shared by both eyes), driven with PWM.
 //   Starting / looking for Wi-Fi ........ blue blinks
-//   Idle (waiting for the wake word) .... green, low brightness
+//   Idle (waiting for the wake word) .... red, full brightness
 //   Robot speaking ...................... green, full brightness
 //   Waiting for you to talk ............. blue, low brightness
 //   You are talking ..................... blue, brighter
 //   Fire / gas (and while the warning
-//   voice is playing) ................... red steady, the other colours off
+//   voice is playing) ................... red blinks fast, the other colours off
+//   Away mode, movement seen ............ red blinks slowly (once a second)
+//   Colour/effect asked by voice ........ for a few seconds (self.eyes.show), then back to normal
 // ---------------------------------------------------------------------------
 class EyeLeds : public Led {
 public:
@@ -279,13 +290,53 @@ private:
         while (true) {
             float target[3] = {0, 0, 0};  // red, green, blue
             float rate = 0.30f;
+            int64_t now = esp_timer_get_time();
             if (g_fire_active || g_gas_active || g_alarm_voice) {
-                target[0] = EYE_RED_LEVEL;
+                target[0] = ((tick / 4) % 2 == 0) ? EYE_RED_LEVEL : 0.0f;  // fast blink (about 3 per second)
+                rate = 0.7f;
+            } else if (g_away_mode && now < g_intruder_until_us) {
+                target[0] = ((tick / 12) % 2 == 0) ? EYE_RED_LEVEL : 0.0f;  // slow blink (once a second)
                 rate = 0.5f;
+            } else if (now < g_eye_override_until_us) {
+                float c[3] = {g_eye_r / 100.0f, g_eye_g / 100.0f, g_eye_b / 100.0f};
+                switch (g_eye_effect) {
+                    case 1: {  // blink
+                        bool on = (tick / 8) % 2 == 0;
+                        for (int i = 0; i < 3; i++) target[i] = on ? c[i] : 0.0f;
+                        rate = 0.6f;
+                        break;
+                    }
+                    case 2: {  // breathe
+                        float k = 0.5f * (1.0f - cosf(tick * 0.0785f));
+                        for (int i = 0; i < 3; i++) target[i] = c[i] * k;
+                        rate = 0.5f;
+                        break;
+                    }
+                    case 3: {  // rainbow: the colour wheel turns once in about 3.6 seconds
+                        float h = fmodf(tick * 4.0f, 360.0f) / 60.0f;
+                        int sector = (int)h;
+                        float f = h - sector;
+                        float rgb[3];
+                        switch (sector % 6) {
+                            case 0: rgb[0] = 1; rgb[1] = f; rgb[2] = 0; break;
+                            case 1: rgb[0] = 1 - f; rgb[1] = 1; rgb[2] = 0; break;
+                            case 2: rgb[0] = 0; rgb[1] = 1; rgb[2] = f; break;
+                            case 3: rgb[0] = 0; rgb[1] = 1 - f; rgb[2] = 1; break;
+                            case 4: rgb[0] = f; rgb[1] = 0; rgb[2] = 1; break;
+                            default: rgb[0] = 1; rgb[1] = 0; rgb[2] = 1 - f; break;
+                        }
+                        for (int i = 0; i < 3; i++) target[i] = rgb[i];
+                        rate = 0.6f;
+                        break;
+                    }
+                    default:
+                        for (int i = 0; i < 3; i++) target[i] = c[i];
+                        break;
+                }
             } else {
                 switch (Application::GetInstance().GetDeviceState()) {
                     case kDeviceStateIdle:
-                        target[1] = EYE_GREEN_DIM;
+                        target[0] = EYE_RED_IDLE;
                         break;
                     case kDeviceStateSpeaking:
                     case kDeviceStateNotifying:
@@ -659,6 +710,19 @@ private:
             if (motion) {
                 g_last_motion_us = esp_timer_get_time();
             }
+            if (g_away_mode && motion) {
+                int64_t now = esp_timer_get_time();
+                if (now >= g_away_armed_us) {
+                    g_intruder_until_us = now + 60LL * 1000000;
+                    int64_t last = g_last_away_notify_us;
+                    if (last == 0 || now - last > 120LL * 1000000) {  // at most one message every 2 minutes
+                        g_last_away_notify_us = now;
+                        QueueNotify("MOTION AT HOME", "The robot saw movement while you are away. Check the house!",
+                                    "warning,eyes", 5);
+                        ESP_LOGW(TAG, "Away mode: movement seen, phone message queued");
+                    }
+                }
+            }
             if (g_pir_mode) {
                 if (motion && !g_lamp_on) {
                     SetLamp(true);
@@ -830,6 +894,82 @@ private:
                          "{\"motion_light\": %s, \"off_after_seconds\": %d, \"motion_detected_now\": %s}",
                          g_pir_mode ? "true" : "false", (int)g_pir_off_seconds, g_motion_now ? "true" : "false");
                 return std::string(buf);
+            });
+        // ---- Away mode: watch the house with the motion sensor ----
+        {
+            Settings settings("away", false);
+            if (settings.GetInt("on", 0) != 0) {
+                g_away_mode = true;
+                g_away_armed_us = esp_timer_get_time() + (int64_t)AWAY_LEAVE_DELAY_SECONDS * 1000000;
+            }
+        }
+        mcp_server.AddTool("self.away.start",
+            "Start the away (guard) mode. Use it when the user says he is going out, e.g. 'I am leaving now'. "
+            "The robot waits about a minute so the user can leave, then watches with the motion sensor. "
+            "If it sees movement it sends a message to the user's phone and its eyes blink red.",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                g_away_armed_us = esp_timer_get_time() + (int64_t)AWAY_LEAVE_DELAY_SECONDS * 1000000;
+                g_intruder_until_us = 0;
+                g_last_away_notify_us = 0;
+                g_away_mode = true;
+                {
+                    Settings settings("away", true);
+                    settings.SetInt("on", 1);
+                }
+                return std::string("{\"success\": true, \"away_mode\": true, \"watch_starts_in_seconds\": " +
+                                   std::to_string(AWAY_LEAVE_DELAY_SECONDS) + "}");
+            });
+        mcp_server.AddTool("self.away.stop",
+            "Stop the away (guard) mode. Use it when the user says he is back, e.g. 'I am back'.",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                g_away_mode = false;
+                g_intruder_until_us = 0;
+                {
+                    Settings settings("away", true);
+                    settings.SetInt("on", 0);
+                }
+                return std::string("{\"success\": true, \"away_mode\": false}");
+            });
+        mcp_server.AddTool("self.away.get_state",
+            "Get whether the away (guard) mode is on and whether movement was seen since it started",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                bool seen = g_last_away_notify_us != 0;
+                return std::string(std::string("{\"away_mode\": ") + (g_away_mode ? "true" : "false") +
+                                   ", \"movement_seen\": " + (seen ? "true" : "false") + "}");
+            });
+
+        // ---- Eyes: colours and effects by voice ----
+        mcp_server.AddTool("self.eyes.show",
+            "Change the colour of the robot's eyes (red, green and blue LEDs) for a few seconds. "
+            "Use it for requests like 'play the eyes game', 'make your eyes red', 'blink', 'rainbow'. "
+            "red, green, blue = brightness 0 to 100 each (mix them: red+green = yellow, green+blue = cyan, "
+            "red+blue = magenta, all three = white). effect = solid, blink, breathe or rainbow "
+            "(rainbow ignores the colour). seconds = how long (1 to 60, default 10); afterwards the eyes "
+            "return to their normal job. For a long game call it again every few seconds with new colours.",
+            PropertyList({Property("red", kPropertyTypeInteger, 0, 0, 100),
+                          Property("green", kPropertyTypeInteger, 0, 0, 100),
+                          Property("blue", kPropertyTypeInteger, 100, 0, 100),
+                          Property("effect", kPropertyTypeString, "solid"),
+                          Property("seconds", kPropertyTypeInteger, 10, 1, 60)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                g_eye_r = properties["red"].value<int>();
+                g_eye_g = properties["green"].value<int>();
+                g_eye_b = properties["blue"].value<int>();
+                std::string e = properties["effect"].value<std::string>();
+                g_eye_effect = e == "blink" ? 1 : e == "breathe" ? 2 : e == "rainbow" ? 3 : 0;
+                int secs = properties["seconds"].value<int>();
+                g_eye_override_until_us = esp_timer_get_time() + (int64_t)secs * 1000000;
+                return std::string("{\"success\": true}");
+            });
+        mcp_server.AddTool("self.eyes.reset",
+            "Return the eyes to their normal behaviour at once (after a colour game or effect).",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                g_eye_override_until_us = 0;
+                return std::string("{\"success\": true}");
             });
         xTaskCreate(PirTask, "pir_monitor", 3072, nullptr, 3, nullptr);
 
