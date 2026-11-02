@@ -7,7 +7,9 @@
 #include "config.h"
 #include "mcp_server.h"
 #include "lamp_controller.h"
-#include "led/single_led.h"
+#include "led/led.h"
+#include <driver/ledc.h>
+#include <driver/gpio.h>
 #include "assets/lang_config.h"
 #include "settings.h"
 
@@ -44,6 +46,8 @@
 static std::atomic<bool> g_fan_on{false};
 static std::atomic<bool> g_fan_auto_on{false};      // true when the temperature rule switched the fan on
 static std::atomic<bool> g_fire_active{false};      // true while the fire alarm is sounding
+static std::atomic<bool> g_gas_active{false};       // true while gas / smoke is detected
+static std::atomic<bool> g_alarm_voice{false};      // true while a danger warning voice is playing (red eyes stay on)
 static std::atomic<int>  g_fan_rule_celsius{0};     // 0 = no rule
 static std::atomic<bool> g_rule_latched{false};     // the rule already acted in this hot period
 static std::atomic<float> g_temp_c{NAN};
@@ -216,6 +220,99 @@ static bool ReadAm2302(gpio_num_t pin, float* temperature, float* humidity, int*
     *humidity = h;
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Eyes: red, green and blue LEDs (each colour on one pin, shared by both eyes), driven with PWM.
+//   Starting / looking for Wi-Fi ........ blue blinks
+//   Idle (waiting for the wake word) .... green, low brightness
+//   Robot speaking ...................... green, full brightness
+//   Waiting for you to talk ............. blue, low brightness
+//   You are talking ..................... blue, brighter
+//   Fire / gas (and while the warning
+//   voice is playing) ................... red steady, the other colours off
+// ---------------------------------------------------------------------------
+class EyeLeds : public Led {
+public:
+    EyeLeds() {
+        ledc_timer_config_t t = {};
+        t.speed_mode = LEDC_LOW_SPEED_MODE;
+        t.duty_resolution = LEDC_TIMER_10_BIT;
+        t.timer_num = LEDC_TIMER_2;
+        t.freq_hz = 1000;
+        t.clk_cfg = LEDC_AUTO_CLK;
+        ESP_ERROR_CHECK(ledc_timer_config(&t));
+        const gpio_num_t pins[3] = {EYE_RED_GPIO, EYE_GREEN_GPIO, EYE_BLUE_GPIO};
+        for (int i = 0; i < 3; i++) {
+            ledc_channel_config_t c = {};
+            c.gpio_num = pins[i];
+            c.speed_mode = LEDC_LOW_SPEED_MODE;
+            c.channel = (ledc_channel_t)(LEDC_CHANNEL_5 + i);
+            c.timer_sel = LEDC_TIMER_2;
+            c.duty = 0;
+            c.hpoint = 0;
+            ESP_ERROR_CHECK(ledc_channel_config(&c));
+        }
+        // Limit the current each pin can give (protects the pins, because green and blue have no resistor).
+        gpio_set_drive_capability(EYE_RED_GPIO, GPIO_DRIVE_CAP_2);
+        gpio_set_drive_capability(EYE_GREEN_GPIO, GPIO_DRIVE_CAP_1);
+        gpio_set_drive_capability(EYE_BLUE_GPIO, GPIO_DRIVE_CAP_1);
+        xTaskCreate(Task, "eye_leds", 3072, this, tskIDLE_PRIORITY + 1, nullptr);
+    }
+
+    void OnStateChanged() override {}  // the task below follows the state by itself
+
+private:
+    float cur_[3] = {0, 0, 0};
+
+    static void Set(int ch, float level) {  // level 0..1
+        if (level < 0) level = 0;
+        if (level > 1) level = 1;
+        float g = level * level;            // gamma: gives smoother low brightness
+        uint32_t duty = (uint32_t)(g * 1023.0f);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)(LEDC_CHANNEL_5 + ch), duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)(LEDC_CHANNEL_5 + ch));
+    }
+
+    static void Task(void* arg) {
+        auto* self = static_cast<EyeLeds*>(arg);
+        int tick = 0;
+        while (true) {
+            float target[3] = {0, 0, 0};  // red, green, blue
+            float rate = 0.30f;
+            if (g_fire_active || g_gas_active || g_alarm_voice) {
+                target[0] = EYE_RED_LEVEL;
+                rate = 0.5f;
+            } else {
+                switch (Application::GetInstance().GetDeviceState()) {
+                    case kDeviceStateIdle:
+                        target[1] = EYE_GREEN_DIM;
+                        break;
+                    case kDeviceStateSpeaking:
+                    case kDeviceStateNotifying:
+                        target[1] = EYE_GREEN_FULL;
+                        break;
+                    case kDeviceStateListening:
+                    case kDeviceStateAudioTesting:
+                        target[2] = Application::GetInstance().IsVoiceDetected() ? EYE_BLUE_FULL : EYE_BLUE_DIM;
+                        break;
+                    case kDeviceStateConnecting:
+                        target[2] = EYE_BLUE_DIM;
+                        break;
+                    default:  // starting, Wi-Fi setup, activating, upgrading, error: blue blinks
+                        target[2] = ((tick / 12) % 2 == 0) ? EYE_BLUE_FULL : 0.0f;  // about 0.5 s on, 0.5 s off
+                        rate = 0.6f;
+                        break;
+                }
+            }
+            for (int i = 0; i < 3; i++) {
+                self->cur_[i] += (target[i] - self->cur_[i]) * rate;
+                Set(i, self->cur_[i]);
+            }
+            tick++;
+            vTaskDelay(pdMS_TO_TICKS(40));
+        }
+    }
+};
 
 class CompactWifiBoard : public WifiBoard {
 private:
@@ -441,16 +538,20 @@ private:
 #if AI_ALERT_ENABLED
                     // The AI speaks the warning. If it cannot (no internet, server asleep), the
                     // recorded voice is played instead, so the alarm never stays silent.
+                    g_alarm_voice = true;
                     int r = AiAlarm("ALERT_FIRE");
                     if (r == 0) {
                         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_FIREALARM);
                     }
+                    g_alarm_voice = false;
                     if (r != -1) {
                         ticks_since_voice = FLAME_REPEAT_TICKS - AI_ALERT_GAP_TICKS;
                     }
 #else
-                    // Blocks until the voice has played (about 8 seconds).
+                    // Blocks until the voice has played (about 8 seconds). The red eyes stay on meanwhile.
+                    g_alarm_voice = true;
                     Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_FIREALARM);
+                    g_alarm_voice = false;
 #endif
                 }
             }
@@ -486,6 +587,7 @@ private:
 
             if (!gas && active_ticks >= GAS_CONFIRM_TICKS) {
                 gas = true;
+                g_gas_active = true;
                 ticks_since_voice = GAS_REPEAT_TICKS;
                 last_notify_us = esp_timer_get_time();
                 QueueNotify("GAS / SMOKE ALERT", "Gas or smoke detected by the robot's gas sensor. Open windows, avoid flames and switches!",
@@ -501,6 +603,7 @@ private:
                 }
             } else if (gas && clear_ticks >= GAS_CLEAR_TICKS) {
                 gas = false;
+                g_gas_active = false;
                 ESP_LOGI(TAG, "Gas sensor no longer detects gas");
                 QueueNotify("Gas cleared", "The gas sensor no longer detects gas or smoke.", "white_check_mark", 3);
                 Application::GetInstance().Schedule([]() {
@@ -522,16 +625,20 @@ private:
                         Application::GetInstance().Alert("GAS!", "GAS / SMOKE DETECTED!", "angry", ALERT_ATTN_SOUND);
                     });
 #if AI_ALERT_ENABLED
+                    g_alarm_voice = true;
                     int r = AiAlarm("ALERT_GAS");
                     if (r == 0) {
                         Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_GASALARM);
                     }
+                    g_alarm_voice = false;
                     if (r != -1) {
                         ticks_since_voice = GAS_REPEAT_TICKS - AI_ALERT_GAP_TICKS;
                     }
 #else
-                    // Blocks until the voice has played.
+                    // Blocks until the voice has played. The red eyes stay on meanwhile.
+                    g_alarm_voice = true;
                     Application::GetInstance().GetAudioService().PlaySound(Lang::Sounds::OGG_GASALARM);
+                    g_alarm_voice = false;
 #endif
                 }
             }
@@ -869,7 +976,7 @@ public:
     }
 
     virtual Led* GetLed() override {
-        static SingleLed led(BUILTIN_LED_GPIO);
+        static EyeLeds led;
         return &led;
     }
 

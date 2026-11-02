@@ -123,4 +123,15 @@
 // While a fire or gas alarm continues, a new message is sent every this many seconds.
 #define NOTIFY_REPEAT_SECONDS 120
 
+// Eye LEDs (5 mm, both eyes share a colour pin): long leg (+) to the pin, short leg (-) to GND.
+// Red has a 220 ohm resistor. Brightness levels are 0.0 (off) to 1.0 (full).
+#define EYE_RED_GPIO   GPIO_NUM_14
+#define EYE_GREEN_GPIO GPIO_NUM_13
+#define EYE_BLUE_GPIO  GPIO_NUM_12
+#define EYE_RED_LEVEL  0.8f
+#define EYE_GREEN_DIM  0.18f
+#define EYE_GREEN_FULL 1.0f
+#define EYE_BLUE_DIM   0.18f
+#define EYE_BLUE_FULL  1.0f
+
 #endif // _BOARD_CONFIG_H_
