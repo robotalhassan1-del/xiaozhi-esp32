@@ -1,0 +1,26 @@
+name: Build Room Node
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 core and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config set network.connection_timeout 600s
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@2.0.17 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli lib install "WiFiManager@2.0.17" "ArduinoJson@7.0.4"
+      - name: Compile
+        run: |
+          mkdir -p sketch/room_node
+          cp room_node.ino sketch/room_node/room_node.ino
+          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir out sketch/room_node
+      - name: List output
+        run: ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: room-node-firmware
+          path: out/*.bin
