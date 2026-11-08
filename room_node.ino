@@ -17,7 +17,7 @@
 // ---- settings you may change ----
 #define SERVER_HOST   "robot-bridge.onrender.com"
 #define ROOM_TOKEN    "__ROOM_TOKEN__"          // replaced by the GitHub build (secret ROOM_TOKEN)
-#define AP_NAME       "Galaxym11"          // name of the setup Wi-Fi
+#define AP_NAME       "Alhassan_Robot"          // name of the setup Wi-Fi
 #define AP_PASSWORD   "Galaxy123"            // password of the setup Wi-Fi (8 characters or more)
 #define PORTAL_AFTER_MS 30000                   // open the setup Wi-Fi after this long without a hotspot
 #define RELAY_ACTIVE_LOW 1                      // 1 = relay switches ON when the pin is LOW (most modules)
