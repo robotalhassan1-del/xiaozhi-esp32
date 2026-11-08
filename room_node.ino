@@ -1,38 +1,61 @@
-// Room node: ESP32 DevKit V1 at the wall switch box.
-// It asks the robot's server (long polling) which of 3 lamps and 1 fan should be on,
-// and drives a 4-channel relay module. The physical wall switches keep working
-// (the relay contacts are wired in parallel with them).
+// Room node v2: ESP32 DevKit V1 at the wall switch box.
+// It asks the robot's server (long polling) which of 3 lamps and 1 fan should be on and drives a
+// 4-channel relay module. The wall switches keep working (relay contacts are wired in parallel).
 //
-// Wi-Fi name, password, server and token are NOT in this file. On the first start the board opens
-// a Wi-Fi called "RoomNode-Setup"; connect with your phone and fill the form.
-// Hold the BOOT button for 5 seconds to erase the settings and set it up again.
+// Wi-Fi: on every start it joins the hotspot it knows. If it cannot join within 30 seconds, it opens its own
+// Wi-Fi "Alhassan_robot" (password below) with a web page where you choose a new hotspot.
+// The server token is built into the firmware (put by the GitHub build from a secret), not asked on the page.
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <WiFiManager.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 
+// ---- settings you may change ----
+#define SERVER_HOST   "robot-bridge.onrender.com"
+#define ROOM_TOKEN    "__ROOM_TOKEN__"          // replaced by the GitHub build (secret ROOM_TOKEN)
+#define AP_NAME       "Galaxym11"          // name of the setup Wi-Fi
+#define AP_PASSWORD   "Galaxy123"            // password of the setup Wi-Fi (8 characters or more)
+#define PORTAL_AFTER_MS 30000                   // open the setup Wi-Fi after this long without a hotspot
+#define RELAY_ACTIVE_LOW 1                      // 1 = relay switches ON when the pin is LOW (most modules)
+
+// ---- pins ----
 #define NUM_RELAYS 4
-static const uint8_t RELAY_PINS[NUM_RELAYS] = {16, 17, 18, 19};          // IN1..IN4
-static const char* RELAY_KEYS[NUM_RELAYS] = {"lamp1", "lamp2", "lamp3", "fan"};
-#define RELAY_ACTIVE_LOW 1   // most 4-channel modules switch ON when the input pin is LOW. Set 0 if yours is the opposite.
-#define STATUS_LED 2         // the blue LED on the DevKit board
-#define RESET_BUTTON 0       // BOOT button
+static const uint8_t RELAY_PINS[NUM_RELAYS] = {16, 17, 18, 19};   // IN1..IN4: lamp1, lamp2, lamp3, fan
+static const uint8_t LED_PINS[NUM_RELAYS]   = {25, 26, 27, 32};   // indicator LED of each relay (with 330 ohm)
+static const char*   RELAY_KEYS[NUM_RELAYS] = {"lamp1", "lamp2", "lamp3", "fan"};
+#define STATUS_LED_EXT 33    // Wi-Fi status LED (with 330 ohm)
+#define STATUS_LED_INT 2     // blue LED on the DevKit board
+#define RESET_BUTTON 0       // BOOT button: hold 5 s to forget the hotspot
 
 Preferences prefs;
-WiFiManager wm;
-char serverHost[64] = "robot-bridge.onrender.com";
-char token[48] = "";
+WebServer web(80);
+DNSServer dns;
+char wifiSsid[33] = "";
+char wifiPass[65] = "";
 bool relayOn[NUM_RELAYS] = {false, false, false, false};
 long lastVersion = -1;
 bool serverOk = false;
-volatile bool shouldSave = false;
+bool portalOn = false;
+uint32_t lostSince = 0;
+uint32_t lastTry = 0;
+
+static void statusLed(bool on) {
+  digitalWrite(STATUS_LED_EXT, on ? HIGH : LOW);
+  digitalWrite(STATUS_LED_INT, on ? HIGH : LOW);
+}
+
+static void blinkStatus(int periodMs) {
+  statusLed((millis() / periodMs) % 2);
+}
 
 static void writeRelay(int i, bool on) {
   bool level = RELAY_ACTIVE_LOW ? !on : on;
   digitalWrite(RELAY_PINS[i], level ? HIGH : LOW);
+  digitalWrite(LED_PINS[i], on ? HIGH : LOW);
 }
 
 static void setRelay(int i, bool on) {
@@ -42,16 +65,105 @@ static void setRelay(int i, bool on) {
   Serial.printf("Relay %s -> %s\n", RELAY_KEYS[i], on ? "ON" : "OFF");
 }
 
+static String htmlEscape(const String& s) {
+  String o;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '&') o += "&amp;";
+    else if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else if (c == '"') o += "&quot;";
+    else o += c;
+  }
+  return o;
+}
+
+// ---------------- setup page ----------------
+static void handleRoot() {
+  int n = WiFi.scanNetworks();
+  String page =
+      "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Alhassan Robot</title><style>body{font-family:sans-serif;margin:16px;max-width:480px}"
+      "input,select,button{width:100%;box-sizing:border-box;font-size:18px;padding:10px;margin:6px 0}"
+      "button{background:#1e63e0;color:#fff;border:0;border-radius:8px}</style></head><body>"
+      "<h2>Alhassan Robot: saita hotspot</h2>"
+      "<form method='POST' action='/save'>"
+      "<label>Zabi hotspot (2.4 GHz):</label><select name='ssid_list'><option value=''>-- zabi --</option>";
+  for (int i = 0; i < n; i++) {
+    String name = WiFi.SSID(i);
+    if (name.length() == 0) continue;
+    page += "<option value=\"" + htmlEscape(name) + "\">" + htmlEscape(name) + " (" + String(WiFi.RSSI(i)) + ")</option>";
+  }
+  page +=
+      "</select><label>ko ka rubuta sunan hotspot:</label><input name='ssid' maxlength='32' placeholder='sunan hotspot'>"
+      "<label>Kalmar sirri:</label><input name='pass' type='password' maxlength='64'>"
+      "<button type='submit'>Ajiye</button></form>"
+      "<p>Hotspot na yanzu: " + htmlEscape(String(wifiSsid)) + "</p></body></html>";
+  WiFi.scanDelete();
+  web.send(200, "text/html", page);
+}
+
+static void handleSave() {
+  String ssid = web.arg("ssid");
+  if (ssid.length() == 0) ssid = web.arg("ssid_list");
+  String pass = web.arg("pass");
+  if (ssid.length() == 0 || ssid.length() > 32 || pass.length() > 64) {
+    web.send(400, "text/html", "<meta charset='utf-8'><p>Sunan hotspot ba daidai ba. <a href='/'>Koma</a></p>");
+    return;
+  }
+  prefs.begin("room", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+  web.send(200, "text/html", "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                             "<h3>An ajiye. Na'urar tana sake farawa...</h3>");
+  delay(1500);
+  ESP.restart();
+}
+
+static void handleRedirect() {
+  web.sendHeader("Location", "http://192.168.4.1/", true);
+  web.send(302, "text/plain", "");
+}
+
+static void startPortal() {
+  if (portalOn) return;
+  Serial.println("Opening setup Wi-Fi: " AP_NAME);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_NAME, AP_PASSWORD);
+  delay(200);
+  dns.start(53, "*", WiFi.softAPIP());
+  web.begin();
+  portalOn = true;
+}
+
+static void stopPortal() {
+  if (!portalOn) return;
+  Serial.println("Closing setup Wi-Fi");
+  web.stop();
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  portalOn = false;
+}
+
+static void tryConnect() {
+  if (wifiSsid[0] == 0) return;
+  WiFi.disconnect();
+  WiFi.begin(wifiSsid, wifiPass);
+  lastTry = millis();
+}
+
 static void checkResetButton() {
   if (digitalRead(RESET_BUTTON) != LOW) return;
   uint32_t start = millis();
   while (digitalRead(RESET_BUTTON) == LOW) {
     if (millis() - start > 5000) {
-      Serial.println("Erasing Wi-Fi settings...");
-      for (int i = 0; i < 6; i++) { digitalWrite(STATUS_LED, !digitalRead(STATUS_LED)); delay(100); }
-      wm.resetSettings();
+      Serial.println("Forgetting the hotspot...");
+      for (int i = 0; i < 6; i++) { statusLed(i % 2); delay(100); }
       prefs.begin("room", false);
-      prefs.clear();
+      prefs.remove("ssid");
+      prefs.remove("pass");
       prefs.end();
       ESP.restart();
     }
@@ -61,59 +173,43 @@ static void checkResetButton() {
 
 void setup() {
   Serial.begin(115200);
-  // All relays OFF first, before the pins become outputs.
-  for (int i = 0; i < NUM_RELAYS; i++) {
+  for (int i = 0; i < NUM_RELAYS; i++) {      // everything OFF before the pins become outputs
     writeRelay(i, false);
     pinMode(RELAY_PINS[i], OUTPUT);
+    pinMode(LED_PINS[i], OUTPUT);
     writeRelay(i, false);
   }
-  pinMode(STATUS_LED, OUTPUT);
+  pinMode(STATUS_LED_EXT, OUTPUT);
+  pinMode(STATUS_LED_INT, OUTPUT);
   pinMode(RESET_BUTTON, INPUT_PULLUP);
+  statusLed(false);
 
-  prefs.begin("room", false);
-  String h = prefs.getString("host", serverHost);
-  String t = prefs.getString("token", "");
-  h.toCharArray(serverHost, sizeof(serverHost));
-  t.toCharArray(token, sizeof(token));
+  prefs.begin("room", true);
+  String s = prefs.getString("ssid", "");
+  String p = prefs.getString("pass", "");
   prefs.end();
+  s.toCharArray(wifiSsid, sizeof(wifiSsid));
+  p.toCharArray(wifiPass, sizeof(wifiPass));
 
+  web.on("/", HTTP_GET, handleRoot);
+  web.on("/save", HTTP_POST, handleSave);
+  web.onNotFound(handleRedirect);
   WiFi.mode(WIFI_STA);
-  WiFiManagerParameter pHost("host", "Server (robot-bridge.onrender.com)", serverHost, 63);
-  WiFiManagerParameter pToken("token", "Token (ROOM_TOKEN)", token, 47);
-  wm.addParameter(&pHost);
-  wm.addParameter(&pToken);
-  wm.setSaveParamsCallback([]() { shouldSave = true; });
-  wm.setConfigPortalTimeout(300);
-
-  if (!wm.getWiFiIsSaved()) {
-    // First start: open the setup Wi-Fi and wait for the phone.
-    digitalWrite(STATUS_LED, HIGH);
-    Serial.println("No Wi-Fi saved: starting setup portal 'RoomNode-Setup'");
-    bool ok = wm.startConfigPortal("RoomNode-Setup");
-    strlcpy(serverHost, pHost.getValue(), sizeof(serverHost));
-    strlcpy(token, pToken.getValue(), sizeof(token));
-    prefs.begin("room", false);
-    prefs.putString("host", serverHost);
-    prefs.putString("token", token);
-    prefs.end();
-    if (!ok) ESP.restart();
+  WiFi.persistent(false);
+  lostSince = millis();
+  if (wifiSsid[0] == 0) {
+    startPortal();                            // nothing saved yet: open the setup Wi-Fi at once
   } else {
-    // Saved network: just keep trying to join it (the hotspot may be switched on later).
-    WiFi.setAutoReconnect(true);
-    WiFi.begin();
+    Serial.printf("Joining hotspot: %s\n", wifiSsid);
+    tryConnect();
   }
-  Serial.printf("Server: %s\n", serverHost);
-}
-
-static void blinkStatus(int periodMs) {
-  digitalWrite(STATUS_LED, (millis() / periodMs) % 2 ? HIGH : LOW);
 }
 
 static void pollServer() {
   WiFiClientSecure client;
   client.setInsecure();   // the token travels inside TLS; the server certificate is not checked
   HTTPClient http;
-  String url = String("https://") + serverHost + "/room/state?token=" + token + "&since=" + String(lastVersion);
+  String url = String("https://") + SERVER_HOST + "/room/state?token=" + ROOM_TOKEN + "&since=" + String(lastVersion);
   http.setReuse(false);
   http.setConnectTimeout(10000);
   http.setTimeout(35000);
@@ -128,8 +224,8 @@ static void pollServer() {
     JsonDocument doc;
     if (deserializeJson(doc, payload) == DeserializationError::Ok) {
       for (int i = 0; i < NUM_RELAYS; i++) {
-        JsonVariant s = doc["state"][RELAY_KEYS[i]];
-        if (!s.isNull()) setRelay(i, s.as<int>() != 0);
+        JsonVariant v = doc["state"][RELAY_KEYS[i]];
+        if (!v.isNull()) setRelay(i, v.as<int>() != 0);
       }
       lastVersion = doc["v"] | -1L;
       serverOk = true;
@@ -145,20 +241,37 @@ static void pollServer() {
 }
 
 void loop() {
-  static uint32_t lostSince = 0;
   checkResetButton();
-  if (WiFi.status() != WL_CONNECTED) {
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (portalOn) {
+    dns.processNextRequest();
+    web.handleClient();
+  }
+
+  if (connected) {
+    lostSince = 0;
+    // Close the setup Wi-Fi once we are online and nobody is using the page.
+    if (portalOn && WiFi.softAPgetStationNum() == 0) stopPortal();
+  } else {
     serverOk = false;
     if (lostSince == 0) lostSince = millis();
-    if (millis() - lostSince > 10UL * 60UL * 1000UL) ESP.restart();  // give the Wi-Fi stack a fresh start
-    blinkStatus(125);   // fast blink: no Wi-Fi
-    delay(50);
+    if (!portalOn && millis() - lostSince >= PORTAL_AFTER_MS) startPortal();
+    if (wifiSsid[0] != 0 && millis() - lastTry > 20000) tryConnect();
+    blinkStatus(125);    // fast blink: looking for the hotspot
+    delay(5);
     return;
   }
-  lostSince = 0;
+
+  if (portalOn) {        // somebody is using the setup page: keep it responsive
+    statusLed(true);
+    delay(5);
+    return;
+  }
+
   pollServer();
   if (serverOk) {
-    digitalWrite(STATUS_LED, HIGH);      // steady: connected to the server
+    statusLed(true);                       // steady: online
     delay(100);
   } else {
     for (int i = 0; i < 6; i++) { blinkStatus(500); delay(100); }   // slow blink: Wi-Fi ok, server not
