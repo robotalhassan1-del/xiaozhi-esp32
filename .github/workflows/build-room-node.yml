@@ -17,9 +17,17 @@ jobs:
         run: |
           arduino-cli config init
           arduino-cli config set network.connection_timeout 600s
-          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          arduino-cli core install esp32:esp32@2.0.17 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          arduino-cli lib install "ArduinoJson@7.0.4"
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          for i in 1 2 3 4 5; do
+            arduino-cli core update-index --additional-urls $URL && arduino-cli core install esp32:esp32@2.0.17 --additional-urls $URL && break
+            echo "Download failed (try $i of 5), waiting before trying again..."
+            sleep $((i * 20))
+            if [ $i -eq 5 ]; then exit 1; fi
+          done
+          for i in 1 2 3; do
+            arduino-cli lib install "ArduinoJson@7.0.4" && break
+            sleep 15
+          done
       - name: Compile
         run: |
           mkdir -p sketch/room_node
