@@ -6,21 +6,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: arduino/setup-arduino-cli@v2
-      - name: Install ESP32 core and libraries
+      - name: Put the token into the firmware
+        env:
+          ROOM_TOKEN: ${{ secrets.ROOM_TOKEN }}
+        run: |
+          if [ -z "$ROOM_TOKEN" ]; then echo "ERROR: the GitHub secret ROOM_TOKEN is missing"; exit 1; fi
+          sed -i "s|__ROOM_TOKEN__|${ROOM_TOKEN}|" room_node.ino
+          grep -c "__ROOM_TOKEN__" room_node.ino || true
+      - name: Install ESP32 core and library
         run: |
           arduino-cli config init
           arduino-cli config set network.connection_timeout 600s
           arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core install esp32:esp32@2.0.17 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          arduino-cli lib install "WiFiManager@2.0.17" "ArduinoJson@7.0.4"
+          arduino-cli lib install "ArduinoJson@7.0.4"
       - name: Compile
         run: |
           mkdir -p sketch/room_node
           cp room_node.ino sketch/room_node/room_node.ino
           arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir out sketch/room_node
-      - name: List output
-        run: ls -la out
+      - name: Merge into one file (flash at 0x0)
+        run: |
+          python3 - <<'PY'
+          import glob
+          def rd(p): return open(p,'rb').read()
+          boot=rd(glob.glob('out/*.bootloader.bin')[0]); part=rd(glob.glob('out/*.partitions.bin')[0])
+          app=[f for f in glob.glob('out/*.ino.bin')][0]; app=rd(app)
+          size=((0x10000+len(app))+0xFFF)//0x1000*0x1000
+          buf=bytearray(b'\xff'*size)
+          buf[0x1000:0x1000+len(boot)]=boot; buf[0x8000:0x8000+len(part)]=part; buf[0x10000:0x10000+len(app)]=app
+          open('out/room_node.merged.bin','wb').write(buf)
+          print('merged', len(buf))
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: room-node-firmware
-          path: out/*.bin
+          path: out/room_node.merged.bin
