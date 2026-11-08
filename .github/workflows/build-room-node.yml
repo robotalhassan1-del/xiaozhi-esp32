@@ -5,44 +5,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: arduino/setup-arduino-cli@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Put the token into the firmware
         env:
           ROOM_TOKEN: ${{ secrets.ROOM_TOKEN }}
         run: |
           if [ -z "$ROOM_TOKEN" ]; then echo "ERROR: the GitHub secret ROOM_TOKEN is missing"; exit 1; fi
           sed -i "s|__ROOM_TOKEN__|${ROOM_TOKEN}|" room_node.ino
-          grep -c "__ROOM_TOKEN__" room_node.ino || true
-      - name: Install ESP32 core and library
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Prepare the project
         run: |
-          arduino-cli config init
-          arduino-cli config set network.connection_timeout 600s
-          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          for i in 1 2 3 4 5; do
-            arduino-cli core update-index --additional-urls $URL && arduino-cli core install esp32:esp32@2.0.17 --additional-urls $URL && break
-            echo "Download failed (try $i of 5), waiting before trying again..."
-            sleep $((i * 20))
-            if [ $i -eq 5 ]; then exit 1; fi
-          done
-          for i in 1 2 3; do
-            arduino-cli lib install "ArduinoJson@7.0.4" && break
-            sleep 15
-          done
+          mkdir -p pio/src
+          cp room_node.ino pio/src/main.cpp
+          sed -i '1i #include <Arduino.h>' pio/src/main.cpp
+          cat > pio/platformio.ini <<'INI'
+          [env:esp32dev]
+          platform = espressif32@6.5.0
+          board = esp32dev
+          framework = arduino
+          lib_deps = bblanchon/ArduinoJson@7.0.4
+          INI
       - name: Compile
         run: |
-          mkdir -p sketch/room_node
-          cp room_node.ino sketch/room_node/room_node.ino
-          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir out sketch/room_node
+          cd pio
+          for i in 1 2 3; do
+            pio run && break
+            echo "Build failed (try $i of 3), waiting before trying again..."
+            sleep 30
+            if [ $i -eq 3 ]; then exit 1; fi
+          done
+          ls -la .pio/build/esp32dev
       - name: Merge into one file (flash at 0x0)
         run: |
           python3 - <<'PY'
-          import glob
-          def rd(p): return open(p,'rb').read()
-          boot=rd(glob.glob('out/*.bootloader.bin')[0]); part=rd(glob.glob('out/*.partitions.bin')[0])
-          app=[f for f in glob.glob('out/*.ino.bin')][0]; app=rd(app)
+          d='pio/.pio/build/esp32dev/'
+          rd=lambda p: open(d+p,'rb').read()
+          boot=rd('bootloader.bin'); part=rd('partitions.bin'); app=rd('firmware.bin')
           size=((0x10000+len(app))+0xFFF)//0x1000*0x1000
           buf=bytearray(b'\xff'*size)
           buf[0x1000:0x1000+len(boot)]=boot; buf[0x8000:0x8000+len(part)]=part; buf[0x10000:0x10000+len(app)]=app
+          import os
+          os.makedirs('out',exist_ok=True)
           open('out/room_node.merged.bin','wb').write(buf)
           print('merged', len(buf))
           PY
