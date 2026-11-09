@@ -15,6 +15,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Put the room token into the firmware
+        shell: bash
+        env:
+          ROOM_TOKEN: ${{ secrets.ROOM_TOKEN }}
+        run: |
+          if [ -z "$ROOM_TOKEN" ]; then echo "ERROR: the GitHub secret ROOM_TOKEN is missing"; exit 1; fi
+          sed -i "s|__ROOM_TOKEN__|${ROOM_TOKEN}|" main/boards/bread-compact-wifi/config.h
+
       - name: Build robot firmware
         shell: bash
         run: |
