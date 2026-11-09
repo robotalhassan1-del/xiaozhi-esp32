@@ -113,6 +113,8 @@
 #define PIR_WARMUP_SECONDS 30
 // Default time without movement before the lamp turns off (voice can change it, 5 - 3600 s).
 #define PIR_DEFAULT_OFF_SECONDS 60
+// Seconds the motion-light mode waits after the voice command before it starts working.
+#define PIR_START_DELAY_SECONDS 10
 
 
 // Phone notifications (ntfy). The same TOPIC must be subscribed in the ntfy app on your phone.
@@ -135,6 +137,11 @@
 #define EYE_BLUE_FULL  1.0f
 
 // Away mode: seconds the robot waits after "I am leaving" before it starts watching.
-#define AWAY_LEAVE_DELAY_SECONDS 60
+#define AWAY_LEAVE_DELAY_SECONDS 10
+
+// Room lamps and fan (the ESP32 at the wall switch) are reached through the robot's server.
+// The token is put in by the GitHub build from the secret ROOM_TOKEN (never write it here: the repo is public).
+#define ROOM_SERVER "https://robot-bridge.onrender.com"
+#define ROOM_TOKEN  "__ROOM_TOKEN__"
 
 #endif // _BOARD_CONFIG_H_

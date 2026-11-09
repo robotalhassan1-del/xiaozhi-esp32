@@ -48,13 +48,16 @@ static std::atomic<bool> g_fan_auto_on{false};      // true when the temperature
 static std::atomic<bool> g_fire_active{false};      // true while the fire alarm is sounding
 static std::atomic<bool> g_gas_active{false};       // true while gas / smoke is detected
 static std::atomic<bool> g_alarm_voice{false};      // true while a danger warning voice is playing (red eyes stay on)
-static std::atomic<int>  g_fan_rule_celsius{0};     // 0 = no rule
+static std::atomic<int>  g_fan_rule_x10{0};         // fan rule: temperature in tenths of a degree (383 = 38.3 C), 0 = no rule
 static std::atomic<bool> g_rule_latched{false};     // the rule already acted in this hot period
 static std::atomic<float> g_temp_c{NAN};
 static std::atomic<float> g_humidity{NAN};
 static std::atomic<int64_t> g_temp_time_us{0};
 static std::atomic<bool> g_lamp_on{false};
 static std::atomic<bool> g_pir_mode{false};         // motion-light mode: motion turns the lamp on, calm turns it off
+static std::atomic<int>  g_motion_lamps_mask{1};    // room lamps used by the motion rule: bit0 = lamp 1, bit1 = lamp 2, bit2 = lamp 3
+static std::atomic<bool> g_motion_lit{false};       // the motion rule has switched the room lamps on
+static std::atomic<int64_t> g_pir_armed_us{0};      // the motion rule starts working at this time
 static std::atomic<int>  g_pir_off_seconds{60};     // lamp goes off after this many seconds without motion
 static std::atomic<int64_t> g_last_motion_us{0};
 static std::atomic<bool> g_motion_now{false};
@@ -145,6 +148,106 @@ static void NotifyTask(void* arg) {
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Commands to the wall switch (room lamps and fan). The robot asks the server, which hands the
+// command to the ESP32 at the wall. Commands are queued and sent by a separate task.
+// ---------------------------------------------------------------------------
+struct RoomCmd {
+    char device[8];   // "lamp1", "lamp2", "lamp3", "fan"
+    bool on;
+};
+static QueueHandle_t g_room_queue = nullptr;
+
+static void RoomSend(const char* device, bool on) {
+    if (g_room_queue == nullptr) {
+        return;
+    }
+    RoomCmd c = {};
+    snprintf(c.device, sizeof(c.device), "%s", device);
+    c.on = on;
+    xQueueSend(g_room_queue, &c, 0);
+}
+
+static void RoomLamps(int mask, bool on) {
+    for (int i = 0; i < 3; i++) {
+        if (mask & (1 << i)) {
+            char d[8];
+            snprintf(d, sizeof(d), "lamp%d", i + 1);
+            RoomSend(d, on);
+        }
+    }
+}
+
+static bool SendRoomCommand(const RoomCmd& c) {
+    auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        return false;
+    }
+    auto http = network->CreateHttp(0);
+    if (!http) {
+        return false;
+    }
+    http->SetTimeout(15000);
+    std::string url = std::string(ROOM_SERVER) + "/room/set?token=" + ROOM_TOKEN + "&device=" + c.device +
+                      "&on=" + (c.on ? "1" : "0");
+    auto opened = http->Open("GET", url);
+    if (!opened) {
+        ESP_LOGE(TAG, "Room command: cannot connect: %s", opened.error().ToString().c_str());
+        return false;
+    }
+    auto status = http->GetStatusCode();
+    bool ok = status && *status >= 200 && *status < 300;
+    if (!ok) {
+        ESP_LOGE(TAG, "Room command: server answered with status %d", status ? *status : -1);
+    }
+    http->ReadAll();
+    http->Close();
+    return ok;
+}
+
+static void RoomTask(void* arg) {
+    RoomCmd c;
+    while (true) {
+        if (xQueueReceive(g_room_queue, &c, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        bool ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            ok = SendRoomCommand(c);
+            if (!ok) {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+        }
+        ESP_LOGI(TAG, "Room command %s %s: %s", c.device, c.on ? "ON" : "OFF", ok ? "sent" : "FAILED");
+    }
+}
+
+// "1", "2", "3", "1,3", "all" ... -> bit mask of room lamps
+static int ParseLampMask(const std::string& s) {
+    if (s.find("all") != std::string::npos || s.find("All") != std::string::npos ||
+        s.find("duk") != std::string::npos) {
+        return 7;
+    }
+    int mask = 0;
+    for (char ch : s) {
+        if (ch >= '1' && ch <= '3') {
+            mask |= 1 << (ch - '1');
+        }
+    }
+    return mask != 0 ? mask : 1;
+}
+
+static std::string LampMaskText(int mask) {
+    std::string t;
+    for (int i = 0; i < 3; i++) {
+        if (mask & (1 << i)) {
+            if (!t.empty()) t += ",";
+            t += std::to_string(i + 1);
+        }
+    }
+    return t;
+}
 
 static void SetFan(bool on) {
     g_fan_on = on;
@@ -723,14 +826,16 @@ private:
                     }
                 }
             }
-            if (g_pir_mode) {
-                if (motion && !g_lamp_on) {
-                    SetLamp(true);
-                    ESP_LOGI(TAG, "Motion: lamp ON");
-                } else if (!motion && g_lamp_on &&
+            if (g_pir_mode && esp_timer_get_time() >= g_pir_armed_us) {
+                if (motion && !g_motion_lit) {
+                    g_motion_lit = true;
+                    RoomLamps(g_motion_lamps_mask, true);
+                    ESP_LOGI(TAG, "Motion: room lamps ON");
+                } else if (!motion && g_motion_lit &&
                            esp_timer_get_time() - g_last_motion_us > (int64_t)g_pir_off_seconds * 1000000) {
-                    SetLamp(false);
-                    ESP_LOGI(TAG, "No motion for %d s: lamp OFF", (int)g_pir_off_seconds);
+                    g_motion_lit = false;
+                    RoomLamps(g_motion_lamps_mask, false);
+                    ESP_LOGI(TAG, "No motion for %d s: room lamps OFF", (int)g_pir_off_seconds);
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -757,25 +862,24 @@ private:
                 g_temp_time_us = esp_timer_get_time();
                 ESP_LOGI(TAG, "Temperature %.1f C, humidity %.1f %%", t, h);
 
-                int threshold = g_fan_rule_celsius;
+                int threshold = g_fan_rule_x10;
                 if (threshold > 0) {
-                    if (t >= threshold && !g_rule_latched) {
+                    int t10 = (int)lroundf(t * 10.0f);
+                    if (t10 >= threshold && !g_rule_latched) {
                         g_rule_latched = true;
-                        if (!g_fan_on) {
-                            SetFan(true);
-                            g_fan_auto_on = true;
-                            ESP_LOGW(TAG, "Temperature rule: fan ON at %.1f C", t);
-                            Application::GetInstance().Schedule([t]() {
-                                char msg[40];
-                                snprintf(msg, sizeof(msg), "Fan ON: %.1f C", t);
-                                Application::GetInstance().Alert("Temperature", msg, "neutral");
-                            });
-                        }
-                    } else if (t <= threshold - TEMP_HYSTERESIS_C && g_rule_latched) {
+                        RoomSend("fan", true);
+                        g_fan_auto_on = true;
+                        ESP_LOGW(TAG, "Temperature rule: room fan ON at %.1f C", t);
+                        Application::GetInstance().Schedule([t]() {
+                            char msg[40];
+                            snprintf(msg, sizeof(msg), "Fan ON: %.1f C", t);
+                            Application::GetInstance().Alert("Temperature", msg, "neutral");
+                        });
+                    } else if (t10 <= threshold - TEMP_HYSTERESIS_C * 10 && g_rule_latched) {
                         g_rule_latched = false;
-                        if (g_fan_auto_on && g_fan_on) {
-                            SetFan(false);
-                            ESP_LOGI(TAG, "Temperature rule: fan OFF at %.1f C", t);
+                        if (g_fan_auto_on) {
+                            RoomSend("fan", false);
+                            ESP_LOGI(TAG, "Temperature rule: room fan OFF at %.1f C", t);
                             Application::GetInstance().Schedule([t]() {
                                 char msg[40];
                                 snprintf(msg, sizeof(msg), "Fan OFF: %.1f C", t);
@@ -820,7 +924,11 @@ private:
         // Load the temperature rule that was saved by voice before the last restart.
         {
             Settings settings("temp_rule", false);
-            g_fan_rule_celsius = settings.GetInt("fan_on_at", 0);
+            int x10 = settings.GetInt("fan_x10", 0);
+            if (x10 == 0) {
+                x10 = settings.GetInt("fan_on_at", 0) * 10;   // rule saved by an older firmware (whole degrees)
+            }
+            g_fan_rule_x10 = x10;
         }
 
         mcp_server.AddTool("self.lamp.get_state", "Get the power state of the lamp", PropertyList(),
@@ -851,33 +959,46 @@ private:
             Settings settings("motion_light", false);
             g_pir_mode = settings.GetInt("on", 0) != 0;
             g_pir_off_seconds = settings.GetInt("secs", PIR_DEFAULT_OFF_SECONDS);
+            g_motion_lamps_mask = settings.GetInt("lamps", 1);
         }
         g_last_motion_us = esp_timer_get_time();
         mcp_server.AddTool("self.motion_light.turn_on",
-            "Turn on the motion-light mode: whenever the motion sensor sees movement, the lamp turns on by "
-            "itself, and when there is no movement for the given number of seconds, the lamp turns off again. "
-            "Use it when the user says things like 'turn on the lamp whenever you sense motion'. "
-            "Optional: seconds = how long without movement before the lamp turns off (default 60).",
-            PropertyList({Property("seconds", kPropertyTypeInteger, PIR_DEFAULT_OFF_SECONDS, 5, 3600)}),
+            "Turn on the motion-light mode for the ROOM lamps (the lamps at the wall switch): whenever the motion "
+            "sensor sees movement, the chosen room lamps turn on by themselves, and when there is no movement for the "
+            "given number of seconds, they turn off again. The mode starts working about 10 seconds after the command. "
+            "Use it when the user says things like 'turn on lamp 2 whenever you sense motion'. "
+            "lamps = which room lamps the user asked for: '1', '2', '3', a list like '1,3', or 'all' for all three lamps. "
+            "seconds = how long without movement before the lamps turn off (default 60).",
+            PropertyList({Property("lamps", kPropertyTypeString, "1"),
+                          Property("seconds", kPropertyTypeInteger, PIR_DEFAULT_OFF_SECONDS, 5, 3600)}),
             [](const PropertyList& properties) -> ReturnValue {
                 int secs = properties["seconds"].value<int>();
+                int mask = ParseLampMask(properties["lamps"].value<std::string>());
                 g_pir_off_seconds = secs;
+                g_motion_lamps_mask = mask;
+                g_motion_lit = false;
                 g_last_motion_us = esp_timer_get_time();
+                g_pir_armed_us = esp_timer_get_time() + (int64_t)PIR_START_DELAY_SECONDS * 1000000;
                 g_pir_mode = true;
                 {
                     Settings settings("motion_light", true);
                     settings.SetInt("on", 1);
                     settings.SetInt("secs", secs);
+                    settings.SetInt("lamps", mask);
                 }
-                char buf[96];
-                snprintf(buf, sizeof(buf), "{\"success\": true, \"motion_light\": true, \"off_after_seconds\": %d}", secs);
+                char buf[160];
+                snprintf(buf, sizeof(buf),
+                         "{\"success\": true, \"motion_light\": true, \"lamps\": \"%s\", \"off_after_seconds\": %d, "
+                         "\"starts_in_seconds\": %d}",
+                         LampMaskText(mask).c_str(), secs, (int)PIR_START_DELAY_SECONDS);
                 return std::string(buf);
             });
         mcp_server.AddTool("self.motion_light.turn_off",
-            "Turn off the motion-light mode. The lamp then obeys only direct commands and stays as it is now.",
+            "Turn off the motion-light mode. The room lamps then stay as they are now.",
             PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
                 g_pir_mode = false;
+                g_motion_lit = false;
                 {
                     Settings settings("motion_light", true);
                     settings.SetInt("on", 0);
@@ -885,14 +1006,15 @@ private:
                 return std::string("{\"success\": true, \"motion_light\": false}");
             });
         mcp_server.AddTool("self.motion_light.get_state",
-            "Get the motion-light mode (on or off), how many seconds without movement turn the lamp off, "
-            "and whether movement is detected right now",
+            "Get the motion-light mode (on or off), which room lamps it uses, how many seconds without movement turn "
+            "them off, and whether movement is detected right now",
             PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
-                char buf[128];
+                char buf[192];
                 snprintf(buf, sizeof(buf),
-                         "{\"motion_light\": %s, \"off_after_seconds\": %d, \"motion_detected_now\": %s}",
-                         g_pir_mode ? "true" : "false", (int)g_pir_off_seconds, g_motion_now ? "true" : "false");
+                         "{\"motion_light\": %s, \"lamps\": \"%s\", \"off_after_seconds\": %d, \"motion_detected_now\": %s}",
+                         g_pir_mode ? "true" : "false", LampMaskText(g_motion_lamps_mask).c_str(),
+                         (int)g_pir_off_seconds, g_motion_now ? "true" : "false");
                 return std::string(buf);
             });
         // ---- Away mode: watch the house with the motion sensor ----
@@ -905,7 +1027,7 @@ private:
         }
         mcp_server.AddTool("self.away.start",
             "Start the away (guard) mode. Use it when the user says he is going out, e.g. 'I am leaving now'. "
-            "The robot waits about a minute so the user can leave, then watches with the motion sensor. "
+            "The robot waits about 10 seconds so the user can leave, then watches with the motion sensor. "
             "If it sees movement it sends a message to the user's phone and its eyes blink red.",
             PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
@@ -971,6 +1093,8 @@ private:
                 g_eye_override_until_us = 0;
                 return std::string("{\"success\": true}");
             });
+        g_room_queue = xQueueCreate(16, sizeof(RoomCmd));
+        xTaskCreate(RoomTask, "room_cmd", 6144, nullptr, 2, nullptr);
         xTaskCreate(PirTask, "pir_monitor", 3072, nullptr, 3, nullptr);
 
         mcp_server.AddTool("self.fan.get_state", "Get the power state of the fan", PropertyList(),
@@ -1018,43 +1142,49 @@ private:
                 return std::string(buf);
             });
         mcp_server.AddTool("self.temperature.set_fan_rule",
-            "Set an automatic fan rule: when the room temperature reaches or goes above the given "
-            "temperature in degrees Celsius, the fan turns on by itself, and it turns off again when the "
-            "room has cooled down by a degree. This replaces any earlier rule. Use it when the user says "
-            "things like 'turn on the fan when the temperature goes above 39'.",
-            PropertyList({Property("temperature", kPropertyTypeInteger, 10, 60)}),
+            "Set an automatic fan rule for the ROOM fan (the fan at the wall switch): when the room temperature "
+            "reaches or goes above the given temperature in degrees Celsius, the fan turns on by itself, and it "
+            "turns off again when the room has cooled down by a degree. This replaces any earlier rule. "
+            "The temperature may have a decimal, written as text, for example '38.3'. Use it when the user says "
+            "things like 'turn on the fan when the temperature reaches 38.3'.",
+            PropertyList({Property("temperature", kPropertyTypeString, "38")}),
             [](const PropertyList& properties) -> ReturnValue {
-                int threshold = properties["temperature"].value<int>();
-                g_fan_rule_celsius = threshold;
+                float v = strtof(properties["temperature"].value<std::string>().c_str(), nullptr);
+                if (!(v >= 10.0f && v <= 60.0f)) {
+                    return std::string("{\"success\": false, \"error\": \"temperature must be between 10 and 60\"}");
+                }
+                int x10 = (int)lroundf(v * 10.0f);
+                g_fan_rule_x10 = x10;
                 g_rule_latched = false;
                 {
                     Settings settings("temp_rule", true);
-                    settings.SetInt("fan_on_at", threshold);
+                    settings.SetInt("fan_x10", x10);
                 }
                 char buf[96];
-                snprintf(buf, sizeof(buf), "{\"success\": true, \"fan_turns_on_at_celsius\": %d}", threshold);
+                snprintf(buf, sizeof(buf), "{\"success\": true, \"fan_turns_on_at_celsius\": %.1f}", x10 / 10.0f);
                 return std::string(buf);
             });
         mcp_server.AddTool("self.temperature.get_fan_rule",
-            "Get the automatic fan rule that is currently set (the temperature at which the fan turns on)",
+            "Get the automatic fan rule that is currently set (the temperature at which the room fan turns on)",
             PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
-                int threshold = g_fan_rule_celsius;
-                if (threshold <= 0) {
+                int x10 = g_fan_rule_x10;
+                if (x10 <= 0) {
                     return std::string("{\"rule_active\": false}");
                 }
                 char buf[96];
-                snprintf(buf, sizeof(buf), "{\"rule_active\": true, \"fan_turns_on_at_celsius\": %d}", threshold);
+                snprintf(buf, sizeof(buf), "{\"rule_active\": true, \"fan_turns_on_at_celsius\": %.1f}", x10 / 10.0f);
                 return std::string(buf);
             });
         mcp_server.AddTool("self.temperature.clear_fan_rule",
             "Remove the automatic temperature rule for the fan",
             PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
-                g_fan_rule_celsius = 0;
+                g_fan_rule_x10 = 0;
                 g_rule_latched = false;
                 {
                     Settings settings("temp_rule", true);
+                    settings.SetInt("fan_x10", 0);
                     settings.SetInt("fan_on_at", 0);
                 }
                 return std::string("{\"success\": true, \"rule_active\": false}");
